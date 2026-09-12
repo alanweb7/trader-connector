@@ -124,7 +124,7 @@ async def list_connections():
     """Lista conexões ativas"""
     connections = broker_registry.list_connections()
     return {
-        "connections": [c.to_dict() for c in connections],
+        "connections": [c.model_dump() for c in connections],
     }
 
 
@@ -159,11 +159,14 @@ async def create_connection(config: ConnectRequest):
             "status": result["status"],
         })
         
+        account_type_val = connection.account_type.value if hasattr(connection.account_type, 'value') else connection.account_type
+        status_val = connection.status.value if hasattr(connection.status, 'value') else connection.status
+        
         return ConnectionResponse(
             id=str(connection.id),
             broker=connection.broker,
-            account_type=connection.account_type.value,
-            status=connection.status.value,
+            account_type=account_type_val,
+            status=status_val,
         )
         
     except Exception as e:
@@ -177,7 +180,7 @@ async def get_connection(connection_id: str):
     if not connection:
         raise HTTPException(status_code=404, detail="Connection not found")
     
-    return connection.to_dict()
+    return connection.model_dump()
 
 
 @app.delete("/connections/{connection_id}")
@@ -275,7 +278,7 @@ async def get_account(connection_id: str):
     
     try:
         account = await adapter.get_account()
-        return account.to_dict()
+        return account.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -293,7 +296,7 @@ async def get_balance(connection_id: str):
     
     try:
         balance = await adapter.get_balance()
-        return balance.to_dict()
+        return balance.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -311,7 +314,7 @@ async def get_assets(connection_id: str):
     
     try:
         assets = await adapter.get_assets()
-        return {"assets": [a.to_dict() for a in assets]}
+        return {"assets": [a.model_dump() for a in assets]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -329,7 +332,7 @@ async def get_asset(connection_id: str, symbol: str):
     
     try:
         asset = await adapter.get_asset(symbol)
-        return asset.to_dict()
+        return asset.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -352,7 +355,7 @@ async def get_candles(
     
     try:
         candles = await adapter.get_candles(asset, timeframe, count)
-        return {"candles": [c.to_dict() for c in candles]}
+        return {"candles": [c.model_dump() for c in candles]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -376,12 +379,12 @@ async def place_order(connection_id: str, order: dict):
             direction=OrderDirection(order.get("direction")),
             amount=order.get("amount"),
             expiration=order.get("expiration", 1),
-            account_type=AccountType(connection.account_type.value),
+            account_type=AccountType(connection.account_type if isinstance(connection.account_type, str) else connection.account_type.value),
             connection_id=connection_id,
         )
         
         result = await adapter.place_order(order_request)
-        return result.to_dict()
+        return result.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -399,7 +402,7 @@ async def get_order(connection_id: str, order_id: str):
     
     try:
         order = await adapter.get_order(order_id)
-        return order.to_dict()
+        return order.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -417,7 +420,7 @@ async def get_order_result(connection_id: str, order_id: str):
     
     try:
         result = await adapter.get_order_result(order_id)
-        return result.to_dict()
+        return result.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

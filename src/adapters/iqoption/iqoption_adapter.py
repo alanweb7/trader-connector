@@ -67,7 +67,7 @@ class IQOptionAdapter(BrokerAdapter):
             self._api = IQ_Option(self._email, self._password)
 
             # Conectar
-            result = self._api.connect()
+            result = await asyncio.to_thread(self._api.connect)
             if not result:
                 raise BrokerError(
                     "Failed to connect to IQ Option",
@@ -77,9 +77,9 @@ class IQOptionAdapter(BrokerAdapter):
 
             # Mudar para conta practice se solicitado
             if account_type == "practice":
-                self._api.change_balance("PRACTICE")
+                await asyncio.to_thread(self._api.change_balance, "PRACTICE")
             else:
-                self._api.change_balance("REAL")
+                await asyncio.to_thread(self._api.change_balance, "REAL")
 
             self._connected = True
             self._authenticated = True
@@ -112,7 +112,7 @@ class IQOptionAdapter(BrokerAdapter):
         """Desconecta do IQ Option"""
         if self._api:
             try:
-                self._api.disconnect()
+                await asyncio.to_thread(self._api.disconnect)
             except Exception:
                 pass
             finally:
@@ -132,7 +132,7 @@ class IQOptionAdapter(BrokerAdapter):
             return {"status": ConnectionStatus.DISCONNECTED.value}
 
         try:
-            is_connected = self._api.check_connect()
+            is_connected = await asyncio.to_thread(self._api.check_connect)
             return {
                 "status": ConnectionStatus.READY.value if is_connected else ConnectionStatus.DISCONNECTED.value,
                 "broker": "iqoption",
@@ -154,7 +154,7 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
 
         try:
-            profile = self._api.get_profile()
+            profile = await asyncio.to_thread(self._api.get_profile)
             return Account(
                 id=str(profile.get("id", "")),
                 broker="iqoption",
@@ -180,7 +180,7 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
 
         try:
-            balance = self._api.get_balance()
+            balance = await asyncio.to_thread(self._api.get_balance)
             return Balance(
                 available=float(balance),
                 currency="USD",
@@ -205,23 +205,29 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
 
         try:
-            # Obter ativos abertos
+            # Obter ativos abertos (roda em thread para nao bloquear)
             assets = []
-            all_assets = self._api.get_all_open_time()
+            all_assets = await asyncio.to_thread(self._api.get_all_open_time, True)
 
-            if all_assets and "turbo" in all_assets:
+            # Verificar se retornou dados validos
+            if all_assets is None:
+                # Mercado pode estar fechado - retornar lista vazia
+                return assets
+
+            if isinstance(all_assets, dict) and "turbo" in all_assets:
                 for symbol, data in all_assets["turbo"].items():
-                    asset = Asset(
-                        symbol=symbol,
-                        name=symbol,
-                        type=AssetType.BINARY,
-                        status=AssetStatus.OPEN if data.get("open", False) else AssetStatus.CLOSED,
-                        payout=data.get("payout", 0),
-                        min_amount=1,
-                        max_amount=1000,
-                        expiration=[1, 5],
-                    )
-                    assets.append(asset)
+                    if isinstance(data, dict):
+                        asset = Asset(
+                            symbol=symbol,
+                            name=symbol,
+                            type=AssetType.BINARY,
+                            status=AssetStatus.OPEN if data.get("open", False) else AssetStatus.CLOSED,
+                            payout=data.get("payout", 0),
+                            min_amount=1,
+                            max_amount=1000,
+                            expiration=[1, 5],
+                        )
+                        assets.append(asset)
 
             return assets
 
@@ -246,7 +252,7 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
 
         try:
-            all_assets = self._api.get_all_open_time()
+            all_assets = await asyncio.to_thread(self._api.get_all_open_time, True)
             if all_assets and "turbo" in all_assets and symbol in all_assets["turbo"]:
                 data = all_assets["turbo"][symbol]
                 return Asset(
@@ -297,11 +303,11 @@ class IQOptionAdapter(BrokerAdapter):
             interval = timeframe * 60
 
             # Obter timestamp final
-            end_time = self._api.get_server_timestamp()
+            end_time = await asyncio.to_thread(self._api.get_server_timestamp)
 
             # Obter candles
-            candles_data = self._api.get_candles(
-                asset, interval, count, end_time
+            candles_data = await asyncio.to_thread(
+                self._api.get_candles, asset, interval, count, end_time
             )
 
             candles = []
@@ -399,11 +405,8 @@ class IQOptionAdapter(BrokerAdapter):
             direction = 1 if order.direction == OrderDirection.CALL else 0
 
             # Enviar ordem
-            result = self._api.buy(
-                order.amount,
-                order.asset,
-                direction,
-                order.expiration,
+            result = await asyncio.to_thread(
+                self._api.buy, order.amount, order.asset, direction, order.expiration
             )
 
             if result and result[0]:
@@ -520,7 +523,7 @@ class IQOptionAdapter(BrokerAdapter):
     async def _get_asset_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Obtém dados do ativo diretamente da API"""
         try:
-            all_assets = self._api.get_all_open_time()
+            all_assets = await asyncio.to_thread(self._api.get_all_open_time, True)
             if all_assets and "turbo" in all_assets and symbol in all_assets["turbo"]:
                 return all_assets["turbo"][symbol]
         except Exception:
