@@ -1,0 +1,36 @@
+version: "3.7"
+
+services:
+  broker-gateway:
+    image: ghcr.io/alanweb7/trader-connector:latest
+    container_name: broker-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - IQOPTION_EMAIL=99tisistemas@gmail.com
+      - IQOPTION_PASSWORD=@seguro#LIVE332
+      - IQOPTION_ACCOUNT_TYPE=practice
+      - PORT=8000
+      - HOST=0.0.0.0
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - traefik.enable=true
+        - "traefik.http.routers.broker-gateway.rule=Host(`connector.ticketpay.app.br`)"
+        - traefik.http.services.broker-gateway.loadbalancer.server.port=8000
+        - traefik.http.routers.broker-gateway.service=broker-gateway
+        - traefik.http.routers.broker-gateway.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.broker-gateway.tls=true
+        - traefik.http.routers.broker-gateway.entrypoints=websecure
+
+networks:
+  traefik_public:
+    name: traefik_public
+    external: true
