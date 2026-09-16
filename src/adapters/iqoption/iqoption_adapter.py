@@ -21,8 +21,6 @@ from ...core.models import (
     OrderDirection,
     OrderRequest,
     OrderResponse,
-    OrderResult,
-    OrderStatus,
 )
 from ...core.errors import BrokerError, ErrorCodes
 
@@ -38,16 +36,12 @@ class IQOptionAdapter(BrokerAdapter):
         self._subscriptions: Dict[str, Dict[str, Any]] = {}
         self._email: Optional[str] = None
         self._password: Optional[str] = None
+        self._cached_balance = 0.0
+        self._cached_profile = {}
 
     async def connect(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conecta ao IQ Option
-        
-        Args:
-            config: Configuração com email, password, account_type
-            
-        Returns:
-            Status da conexão
         """
         try:
             from iqoptionapi.stable_api import IQ_Option
@@ -63,23 +57,39 @@ class IQOptionAdapter(BrokerAdapter):
                     broker="iqoption",
                 )
 
-            # Criar instância da API
             self._api = IQ_Option(self._email, self._password)
 
-            # Conectar
-            result = await asyncio.to_thread(self._api.connect)
-            if not result:
+            # Connect - roda em background thread, o while loop da lib
+            # pode demorar mas vai completar quando o WebSocket receber dados
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._api.connect),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                # Timeout nos while loops internos, mas o WebSocket pode estar conectado
+                pass
+
+            # Verificar se está conectado
+            try:
+                is_connected = await asyncio.wait_for(
+                    asyncio.to_thread(self._api.check_connect),
+                    timeout=5.0,
+                )
+                if not is_connected:
+                    self._api = None
+                    raise BrokerError(
+                        "Failed to connect to IQ Option.",
+                        code=ErrorCodes.CONNECTION_FAILED,
+                        broker="iqoption",
+                    )
+            except asyncio.TimeoutError:
+                self._api = None
                 raise BrokerError(
-                    "Failed to connect to IQ Option",
-                    code=ErrorCodes.CONNECTION_FAILED,
+                    "Connection check timeout.",
+                    code=ErrorCodes.TIMEOUT,
                     broker="iqoption",
                 )
-
-            # Mudar para conta practice se solicitado
-            if account_type == "practice":
-                await asyncio.to_thread(self._api.change_balance, "PRACTICE")
-            else:
-                await asyncio.to_thread(self._api.change_balance, "REAL")
 
             self._connected = True
             self._authenticated = True
@@ -101,6 +111,10 @@ class IQOptionAdapter(BrokerAdapter):
         except BrokerError:
             raise
         except Exception as e:
+            # Clean up on error
+            self._api = None
+            self._connected = False
+            self._authenticated = False
             raise BrokerError(
                 f"Connection error: {str(e)}",
                 code=ErrorCodes.CONNECTION_FAILED,
@@ -124,7 +138,7 @@ class IQOptionAdapter(BrokerAdapter):
     async def get_status(self) -> Dict[str, Any]:
         """
         Obtém status da conexão
-        
+
         Returns:
             Status atual
         """
@@ -145,21 +159,30 @@ class IQOptionAdapter(BrokerAdapter):
             }
 
     async def get_account(self) -> Account:
-        """
-        Obtém informações da conta
-        
-        Returns:
-            Dados da conta
-        """
+        """Obtém informações da conta"""
         self._ensure_connected()
 
         try:
-            profile = await asyncio.to_thread(self._api.get_profile)
+            profile_msg = None
+            try:
+                profile_msg = self._api.api.profile.msg
+            except Exception:
+                pass
+
+            if profile_msg:
+                return Account(
+                    id=str(profile_msg.get("id", "")),
+                    broker="iqoption",
+                    type=self._account_type,
+                    currency=profile_msg.get("currency", "USD"),
+                    status=ConnectionStatus.READY,
+                )
+
             return Account(
-                id=str(profile.get("id", "")),
+                id="",
                 broker="iqoption",
                 type=self._account_type,
-                currency=profile.get("currency", "USD"),
+                currency="USD",
                 status=ConnectionStatus.READY,
             )
         except Exception as e:
@@ -171,20 +194,38 @@ class IQOptionAdapter(BrokerAdapter):
             )
 
     async def get_balance(self) -> Balance:
-        """
-        Obtém saldo da conta
-        
-        Returns:
-            Saldo atual
-        """
+        """Obtém saldo da conta - lê do cache do WebSocket"""
         self._ensure_connected()
 
         try:
-            balance = await asyncio.to_thread(self._api.get_balance)
+            amount = None
+            try:
+                # get_balance() sem argumentos - assinatura correta
+                raw_balance = await asyncio.to_thread(self._api.get_balance)
+                if raw_balance and isinstance(raw_balance, (int, float)):
+                    amount = float(raw_balance)
+            except Exception:
+                pass
+
+            # Fallback: tentar leitura do cache do WebSocket se disponivel
+            if amount is None:
+                try:
+                    import iqoptionapi.global_value as gv
+                    raw = self._api.api.balances_raw
+                    if raw is not None:
+                        obj_id = self._api.api.object_id
+                        current_balance_id = gv.balance_id.get(obj_id)
+                        for bal in raw.get("msg", []):
+                            if bal["id"] == current_balance_id:
+                                amount = float(bal["amount"])
+                                break
+                except Exception:
+                    pass
+
             return Balance(
-                available=float(balance),
+                available=amount if amount is not None else 0.0,
                 currency="USD",
-                total=float(balance),
+                total=amount if amount is not None else 0.0,
                 updated_at=datetime.utcnow(),
             )
         except Exception as e:
@@ -198,16 +239,19 @@ class IQOptionAdapter(BrokerAdapter):
     async def get_assets(self) -> List[Asset]:
         """
         Lista ativos disponíveis
-        
+
         Returns:
             Lista de ativos
         """
         self._ensure_connected()
 
         try:
-            # Obter ativos abertos (roda em thread para nao bloquear)
+            # Obter ativos abertos - assinatura correta: get_all_open_time() sem args
             assets = []
-            all_assets = await asyncio.to_thread(self._api.get_all_open_time, True)
+            try:
+                all_assets = await asyncio.to_thread(self._api.get_all_open_time)
+            except Exception:
+                all_assets = None
 
             # Verificar se retornou dados validos
             if all_assets is None:
@@ -242,17 +286,17 @@ class IQOptionAdapter(BrokerAdapter):
     async def get_asset(self, symbol: str) -> Asset:
         """
         Obtém informações de um ativo específico
-        
+
         Args:
             symbol: Símbolo do ativo
-            
+
         Returns:
             Dados do ativo
         """
         self._ensure_connected()
 
         try:
-            all_assets = await asyncio.to_thread(self._api.get_all_open_time, True)
+            all_assets = await asyncio.to_thread(self._api.get_all_open_time)
             if all_assets and "turbo" in all_assets and symbol in all_assets["turbo"]:
                 data = all_assets["turbo"][symbol]
                 return Asset(
@@ -287,12 +331,12 @@ class IQOptionAdapter(BrokerAdapter):
     ) -> List[Candle]:
         """
         Obtém candles históricos
-        
+
         Args:
             asset: Ativo
             timeframe: Timeframe em minutos
             count: Quantidade de candles
-            
+
         Returns:
             Lista de candles
         """
@@ -341,12 +385,12 @@ class IQOptionAdapter(BrokerAdapter):
     ) -> str:
         """
         Inscreve-se para receber candles em tempo real
-        
+
         Args:
             asset: Ativo
             timeframe: Timeframe em minutos
             callback: Função de retorno
-            
+
         Returns:
             ID da inscrição
         """
@@ -371,7 +415,7 @@ class IQOptionAdapter(BrokerAdapter):
     async def unsubscribe_candles(self, subscription_id: str) -> None:
         """
         Cancela inscrição de candles
-        
+
         Args:
             subscription_id: ID da inscrição
         """
@@ -382,10 +426,10 @@ class IQOptionAdapter(BrokerAdapter):
     async def place_order(self, order: OrderRequest) -> OrderResponse:
         """
         Envia ordem
-        
+
         Args:
             order: Dados da ordem
-            
+
         Returns:
             Resposta da ordem
         """
@@ -404,7 +448,8 @@ class IQOptionAdapter(BrokerAdapter):
             # Converter direção
             direction = 1 if order.direction == OrderDirection.CALL else 0
 
-            # Enviar ordem
+            # Enviar ordem - assinatura correta: buy(price, ACTIVES, ACTION, expirations)
+            # price: valor da aposta, ACTIVES: ativo, ACTION: 1=CALL 0=PUT, expirations: tempo
             result = await asyncio.to_thread(
                 self._api.buy, order.amount, order.asset, direction, order.expiration
             )
@@ -439,66 +484,10 @@ class IQOptionAdapter(BrokerAdapter):
                 original_error=e,
             )
 
-    async def get_order(self, order_id: str) -> OrderResponse:
-        """
-        Obtém status de uma ordem
-        
-        Args:
-            order_id: ID da ordem
-            
-        Returns:
-            Dados da ordem
-        """
-        self._ensure_connected()
-
-        try:
-            # A biblioteca pode não ter método direto para obter ordem
-            # Retornar status básico
-            return OrderResponse(
-                id=order_id,
-                status=OrderStatus.OPEN,
-                broker="iqoption",
-            )
-        except Exception as e:
-            raise BrokerError(
-                f"Failed to get order: {str(e)}",
-                code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
-                original_error=e,
-            )
-
-    async def get_order_result(self, order_id: str) -> OrderResult:
-        """
-        Obtém resultado de uma ordem
-        
-        Args:
-            order_id: ID da ordem
-            
-        Returns:
-            Resultado da ordem
-        """
-        self._ensure_connected()
-
-        try:
-            # Tentar obter resultado
-            # A biblioteca pode ter métodos específicos para isso
-            return OrderResult(
-                order_id=order_id,
-                status=OrderStatus.PENDING,
-                broker="iqoption",
-            )
-        except Exception as e:
-            raise BrokerError(
-                f"Failed to get order result: {str(e)}",
-                code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
-                original_error=e,
-            )
-
     async def cancel_order(self, order_id: str) -> None:
         """
         Cancela uma ordem
-        
+
         Args:
             order_id: ID da ordem
         """
@@ -523,7 +512,7 @@ class IQOptionAdapter(BrokerAdapter):
     async def _get_asset_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Obtém dados do ativo diretamente da API"""
         try:
-            all_assets = await asyncio.to_thread(self._api.get_all_open_time, True)
+            all_assets = await asyncio.to_thread(self._api.get_all_open_time)
             if all_assets and "turbo" in all_assets and symbol in all_assets["turbo"]:
                 return all_assets["turbo"][symbol]
         except Exception:

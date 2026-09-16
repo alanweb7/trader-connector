@@ -139,36 +139,10 @@ class BrokerAdapter(ABC):
         pass
 
     @abstractmethod
-    async def get_order(self, order_id: str) -> OrderResponse:
-        """
-        Obtém status de uma ordem
-        
-        Args:
-            order_id: ID da ordem
-            
-        Returns:
-            Dados da ordem
-        """
-        pass
-
-    @abstractmethod
-    async def get_order_result(self, order_id: str) -> OrderResult:
-        """
-        Obtém resultado de uma ordem
-        
-        Args:
-            order_id: ID da ordem
-            
-        Returns:
-            Resultado da ordem
-        """
-        pass
-
-    @abstractmethod
     async def cancel_order(self, order_id: str) -> None:
         """
         Cancela uma ordem
-        
+
         Args:
             order_id: ID da ordem
         """
