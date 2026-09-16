@@ -5,6 +5,7 @@ WORKDIR /app
 # Instalar dependências do sistema
 RUN apt-get update && apt-get install -y \
     gcc \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiar arquivos de dependência
@@ -12,7 +13,7 @@ COPY pyproject.toml .
 COPY src/ src/
 
 # Instalar dependências
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir .
 
 # Copiar resto do código
 COPY . .
