@@ -4,6 +4,12 @@ Executar: python scripts/lean_iq_test.py
 """
 import sys
 import os
+
+if not os.environ.get("IQOPTION_EMAIL") or not os.environ.get("IQOPTION_PASSWORD"):
+    raise SystemExit(
+        "Defina IQOPTION_EMAIL e IQOPTION_PASSWORD no ambiente antes de executar."
+    )
+
 import time
 import threading
 import traceback
@@ -11,9 +17,8 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.abspath(__file__)) + "/..")
 
-EMAIL = "99tisistemas@gmail.com"
-PASSWORD = "@seguro#LIVE332"
-
+EMAIL = os.environ["IQOPTION_EMAIL"]  # defina antes de executar
+PASSWORD = os.environ["IQOPTION_PASSWORD"]  # defina antes de executar
 from iqoptionapi.stable_api import IQ_Option
 
 RESULT = {}

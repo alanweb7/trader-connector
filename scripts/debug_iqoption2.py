@@ -2,6 +2,12 @@
 import asyncio
 import sys
 import os
+
+if not os.environ.get("IQOPTION_EMAIL") or not os.environ.get("IQOPTION_PASSWORD"):
+    raise SystemExit(
+        "Defina IQOPTION_EMAIL e IQOPTION_PASSWORD no ambiente antes de executar."
+    )
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
@@ -12,8 +18,8 @@ from src.core.errors import BrokerError
 
 
 async def debug():
-    email = "99tisistemas@gmail.com"
-    password = "@seguro#LIVE332"
+    email = os.environ["IQOPTION_EMAIL"]  # defina antes de executar
+    password = os.environ["IQOPTION_PASSWORD"]  # defina antes de executar
     account_type = "practice"
 
     adapter = IQOptionAdapter()

@@ -3,8 +3,8 @@ import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.abspath(__file__)) + "/..")
 
-EMAIL = "99tisistemas@gmail.com"
-PASSWORD = "@seguro#LIVE332"
+EMAIL = os.environ["IQOPTION_EMAIL"]  # defina antes de executar
+PASSWORD = os.environ["IQOPTION_PASSWORD"]  # defina antes de executar
 from iqoptionapi.stable_api import IQ_Option
 
 def step(label, fn, *args, **kw):
