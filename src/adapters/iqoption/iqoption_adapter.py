@@ -160,7 +160,7 @@ class IQOptionAdapter(BrokerAdapter):
                 self._connected = False
                 self._authenticated = False
                 raise BrokerError(
-                    f"Connection error: {str(e)}",
+                    self._format_connect_error(e),
                     code=ErrorCodes.CONNECTION_FAILED,
                     broker="iqoption",
                     original_error=e,
@@ -567,6 +567,33 @@ class IQOptionAdapter(BrokerAdapter):
         if mode == "real":
             return "REAL"
         return "PRACTICE"
+
+    @staticmethod
+    def _format_connect_error(e: Exception) -> str:
+        """
+        Formata o erro de conexão para o usuário.
+
+        Bug conhecido da lib iqoptionapi (stable_api.py:142): quando o
+        WebSocket falha, `json.loads(reason)` gera um JSONDecodeError
+        ("Expecting value: line 1 column 2") que mascara o motivo real
+        da falha — que fica em global_value.websocket_error_reason.
+        Traduz esses casos para uma mensagem útil.
+        """
+        msg = str(e)
+        try:
+            import iqoptionapi.global_value as _gv
+            reason = getattr(_gv, "websocket_error_reason", None)
+        except Exception:
+            reason = None
+
+        if "Expecting value" in msg and reason:
+            return f"IQ Option inacessível (WebSocket): {reason}"
+        if "Expecting value" in msg:
+            return (
+                "IQ Option inacessível (WebSocket): não foi possível conectar a "
+                "iqoption.com. Verifique rede/proxy/firewall."
+            )
+        return f"Connection error: {msg}"
 
     async def _get_asset_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Obtém dados do ativo diretamente da API"""
