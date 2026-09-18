@@ -80,15 +80,39 @@ class ConnectionRepository:
             return result.data[0]
         raise Exception("Failed to create connection")
 
+    def _decrypt_email(self, email_encrypted: Optional[str]) -> str:
+        """
+        Decripta apenas o email (para exibição no card/modal de edição).
+        Não decripta a senha — ela nunca deve sair do backend.
+        """
+        if not email_encrypted:
+            return ""
+        db = get_supabase()
+        try:
+            decrypted = db.rpc(
+                "decrypt_broker_credentials",
+                {
+                    "p_email_encrypted": email_encrypted,
+                    "p_password_encrypted": "",
+                    "p_encryption_key": self.encryption_key,
+                },
+            ).execute()
+            # Faz o downgrade da senha se a RPC tiver esse problema
+            if decrypted.data:
+                return decrypted.data[0].get("email", "") or ""
+            return ""
+        except Exception:
+            return ""
+
     def get_by_id(self, connection_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get connection by ID (without decrypted credentials)
-        
+        Get connection by ID (safe fields + plain email for edit UI)
+
         Args:
             connection_id: Connection UUID
-            
+
         Returns:
-            Connection record or None
+            Connection record (without password) or None
         """
         db = get_supabase()
         result = (
@@ -97,7 +121,20 @@ class ConnectionRepository:
             .eq("id", connection_id)
             .execute()
         )
-        return result.data[0] if result.data else None
+        if not result.data:
+            return None
+        record = result.data[0]
+        raw = (
+            db.table("broker_connections")
+            .select("email_encrypted")
+            .eq("id", connection_id)
+            .single()
+            .execute()
+        )
+        record["email"] = self._decrypt_email(raw.data.get("email_encrypted"))
+        record.pop("email_encrypted", None)
+        record.pop("password_encrypted", None)
+        return record
 
     def get_with_credentials(self, connection_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -150,22 +187,42 @@ class ConnectionRepository:
 
     def list_all(self, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        List all connections (without credentials)
-        
+        List all connections (safe fields + plain email for edit UI)
+
         Args:
             user_id: Optional user ID filter
-            
+
         Returns:
-            List of connection records
+            List of connection records (no password)
         """
         db = get_supabase()
         query = db.table("broker_connections_safe").select("*")
-        
+
         if user_id:
             query = query.eq("user_id", user_id)
-        
+
         result = query.order("created_at", desc=True).execute()
-        return result.data or []
+        records = result.data or []
+
+        # Incluir email decriptado (nunca a senha)
+        raws = (
+            db.table("broker_connections")
+            .select("id,email_encrypted")
+            .execute()
+        )
+        raw_map = {r["id"]: r.get("email_encrypted") for r in (raws.data or [])}
+        for record in records:
+            record["email"] = self._decrypt_email(raw_map.get(record["id"]))
+        return records
+
+    def update_account_id(self, connection_id: str, account_id: str) -> None:
+        """Persist the broker account id (e.g. IQ Option profile id)"""
+        if not account_id:
+            return
+        db = get_supabase()
+        db.table("broker_connections").update(
+            {"account_id": str(account_id), "updated_at": datetime.utcnow().isoformat()}
+        ).eq("id", connection_id).execute()
 
     def update_status(
         self,

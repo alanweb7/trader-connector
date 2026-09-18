@@ -225,6 +225,14 @@ async def create_connection(config: ConnectRequest):
         # Update status
         connection.status = ConnectionStatus(result["status"])
         connection_repository.update_status(connection_id, result["status"])
+
+        # Persistir ID da conta na corretora (card UI / diagnóstico)
+        try:
+            account = await adapter.get_account()
+            if account and account.id:
+                connection_repository.update_account_id(connection_id, str(account.id))
+        except Exception as acct_err:
+            print(f"[BrokerGateway] Could not persist account_id for {connection_id}: {acct_err}")
         
         # Emit event
         await event_manager.emit("connection.created", {
@@ -417,7 +425,15 @@ async def connect_connection(connection_id: str):
         
         connection.status = ConnectionStatus(result["status"])
         connection_repository.update_status(connection_id, result["status"])
-        
+
+        # Persistir ID da conta na corretora (card UI / diagnóstico)
+        try:
+            account = await adapter.get_account()
+            if account and account.id:
+                connection_repository.update_account_id(connection_id, str(account.id))
+        except Exception as acct_err:
+            print(f"[BrokerGateway] Could not persist account_id for {connection_id}: {acct_err}")
+
         connection_repository.log_event(
             "connection.reconnected",
             connection_id=connection_id,
