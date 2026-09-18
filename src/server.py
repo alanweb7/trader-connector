@@ -182,7 +182,7 @@ async def create_connection(config: ConnectRequest):
     try:
         # Generate connection name if not provided
         conn_name = config.name or f"{config.account_type.title()} Account"
-        
+
         # Save to database first
         db_conn = connection_repository.create(
             name=conn_name,
@@ -192,7 +192,7 @@ async def create_connection(config: ConnectRequest):
             account_type=config.account_type,
         )
         connection_id = db_conn["id"]
-        
+
         # Create in-memory connection
         connection = Connection(
             broker="iqoption",
@@ -200,10 +200,10 @@ async def create_connection(config: ConnectRequest):
         )
         connection.id = connection_id
         connection.status = ConnectionStatus.CONNECTING
-        
+
         # Register in memory
         broker_registry.register_connection(connection_id, connection)
-        
+
         # Update database status
         connection_repository.update_status(connection_id, "connecting")
         connection_repository.log_event(
@@ -211,7 +211,7 @@ async def create_connection(config: ConnectRequest):
             connection_id=connection_id,
             event_data={"broker": "iqoption", "account_type": config.account_type},
         )
-        
+
         # Connect to broker — usa o adapter dedicado desta connection (sessão isolada)
         adapter = broker_registry.get_adapter_for_connection(connection_id)
         if not adapter:

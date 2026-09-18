@@ -14,8 +14,8 @@ load_dotenv()
 from src.adapters.iqoption import IQOptionAdapter
 from src.core.errors import BrokerError
 
-EMAIL = os.getenv("IQOPTION_EMAIL", "99tisistemas@gmail.com")
-PASSWORD = os.getenv("IQOPTION_PASSWORD", "@seguro#LIVE332")
+EMAIL = os.environ["IQOPTION_EMAIL"]  # obrigatório: defina antes de executar
+PASSWORD = os.environ["IQOPTION_PASSWORD"]  # obrigatório: defina antes de executar
 ACCOUNT_TYPE = os.getenv("IQOPTION_ACCOUNT_TYPE", "practice")
 
 

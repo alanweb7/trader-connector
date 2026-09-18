@@ -33,10 +33,8 @@ async def test_connection():
     if not email or not password:
         print("ERRO: Credenciais nao configuradas!")
         print()
-        print("Configure o arquivo .env:")
-        print("  IQOPTION_EMAIL=seu_email@example.com")
-        print("  IQOPTION_PASSWORD=sua_senha")
-        print("  IQOPTION_ACCOUNT_TYPE=practice")
+        print("Defina IQOPTION_EMAIL e IQOPTION_PASSWORD no ambiente antes de executar:")
+        print("  IQOPTION_EMAIL=user@example.com IQOPTION_PASSWORD=secret python scripts/test_iqoption_connection.py")
         return
 
     print("Email:", email)

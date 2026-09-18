@@ -8,9 +8,8 @@ services:
     environment:
       - PORT=8000
       - HOST=0.0.0.0
-      - IQOPTION_EMAIL=${IQOPTION_EMAIL}
-      - IQOPTION_PASSWORD=${IQOPTION_PASSWORD}
-      - IQOPTION_ACCOUNT_TYPE=${IQOPTION_ACCOUNT_TYPE:-practice}
+      # Credenciais de corretora são injetadas em runtime pelo frontend via
+      # POST /connections. Não usar IQOPTION_*/AVALON_* aqui.
     volumes:
       - .:/app
     restart: unless-stopped

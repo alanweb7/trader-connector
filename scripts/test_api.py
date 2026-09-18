@@ -27,8 +27,8 @@ def test_health():
 def test_create_connection():
     print("\n[2] Criando conexao com IQ Option...")
     r = httpx.post(f"{BASE_URL}/connections", json={
-        "email": "alanweb7@gmail.com",
-        "password": "@seguro#LIVE332",
+        "email": os.environ["IQOPTION_EMAIL"],
+        "password": os.environ["IQOPTION_PASSWORD"],
         "account_type": "practice"
     }, timeout=60)
     print_json(r.json(), "CONNECTION CREATED")
