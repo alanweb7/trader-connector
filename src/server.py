@@ -212,8 +212,10 @@ async def create_connection(config: ConnectRequest):
             event_data={"broker": "iqoption", "account_type": config.account_type},
         )
         
-        # Connect to broker
-        adapter = broker_registry.get("iqoption")
+        # Connect to broker — usa o adapter dedicado desta connection (sessão isolada)
+        adapter = broker_registry.get_adapter_for_connection(connection_id)
+        if not adapter:
+            raise HTTPException(status_code=500, detail="Adapter not initialized")
         result = await adapter.connect({
             "email": config.email,
             "password": config.password,

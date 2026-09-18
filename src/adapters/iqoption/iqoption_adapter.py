@@ -28,6 +28,10 @@ from ...core.errors import BrokerError, ErrorCodes
 class IQOptionAdapter(BrokerAdapter):
     """Adapter para IQ Option"""
 
+    # Lock global para serializar logins (lib iqoptionapi usa module-level globals
+    # que não suportam múltiplas sessões simultâneas). Conexões são feitas uma por vez.
+    _login_lock: Optional[asyncio.Lock] = None
+
     def __init__(self):
         self._api = None
         self._connected = False
@@ -38,106 +42,129 @@ class IQOptionAdapter(BrokerAdapter):
         self._password: Optional[str] = None
         self._cached_balance = 0.0
         self._cached_profile = {}
+        if IQOptionAdapter._login_lock is None:
+            IQOptionAdapter._login_lock = asyncio.Lock()
 
     async def connect(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Conecta ao IQ Option
+        Conecta ao IQ Option.
+
+        IMPORTANTE: a lib iqoptionapi usa globals em `iqoptionapi.global_value`
+        (SSID, balance_id) que são compartilhados por todas as instâncias IQ_Option.
+        Isso significa que múltiplas conexões simultâneas não funcionam — uma
+        segunda conexão reusa o SSID da primeira (api.py:847-850).
+
+        Para suportar múltiplos usuários sequencialmente:
+        1. Lock global garante que apenas UM login ocorre por vez
+        2. Resetamos os globals ANTES de criar o novo IQ_Option, forçando
+           re-autenticação com as credenciais novas
+        3. Fechamos explicitamente o WebSocket anterior para limpar estado
         """
-        try:
-            from iqoptionapi.stable_api import IQ_Option
-
-            self._email = config.get("email")
-            self._password = config.get("password")
-            account_type = config.get("account_type", "practice")
-
-            if not self._email or not self._password:
-                raise BrokerError(
-                    "Email and password are required",
-                    code=ErrorCodes.INVALID_CREDENTIALS,
-                    broker="iqoption",
-                )
-
-            self._api = IQ_Option(self._email, self._password)
-
-            # Connect - roda em background thread, o while loop da lib
-            # pode demorar mas vai completar quando o WebSocket receber dados
+        async with self._login_lock:
             try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._api.connect),
-                    timeout=30.0,
-                )
-            except asyncio.TimeoutError:
-                # Timeout nos while loops internos, mas o WebSocket pode estar conectado
-                pass
+                from iqoptionapi.stable_api import IQ_Option
+                import iqoptionapi.global_value as gv
 
-            # Verificar se está conectado
-            try:
-                is_connected = await asyncio.wait_for(
-                    asyncio.to_thread(self._api.check_connect),
-                    timeout=5.0,
-                )
-                if not is_connected:
-                    self._api = None
+                self._email = config.get("email")
+                self._password = config.get("password")
+                account_type = config.get("account_type", "practice")
+
+                if not self._email or not self._password:
                     raise BrokerError(
-                        "Failed to connect to IQ Option.",
-                        code=ErrorCodes.CONNECTION_FAILED,
+                        "Email and password are required",
+                        code=ErrorCodes.INVALID_CREDENTIALS,
                         broker="iqoption",
                     )
-            except asyncio.TimeoutError:
-                self._api = None
+
+                # Resetar globals da lib — sem isso, IQ_Option.connect() reusa o SSID
+                # da sessão anterior (api.py:847-850: "doing temp ssid reconnect for speed up")
+                gv.SSID = None
+                gv.balance_id = None
+                gv.check_websocket_if_connect = None
+                gv.check_websocket_if_error = False
+                gv.websocket_error_reason = None
+
+                self._api = IQ_Option(self._email, self._password)
+
+                # Connect - roda em background thread, o while loop da lib
+                # pode demorar mas vai completar quando o WebSocket receber dados
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self._api.connect),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Timeout nos while loops internos, mas o WebSocket pode estar conectado
+                    pass
+
+                # Verificar se está conectado
+                try:
+                    is_connected = await asyncio.wait_for(
+                        asyncio.to_thread(self._api.check_connect),
+                        timeout=5.0,
+                    )
+                    if not is_connected:
+                        self._api = None
+                        raise BrokerError(
+                            "Failed to connect to IQ Option.",
+                            code=ErrorCodes.CONNECTION_FAILED,
+                            broker="iqoption",
+                        )
+                except asyncio.TimeoutError:
+                    self._api = None
+                    raise BrokerError(
+                        "Connection check timeout.",
+                        code=ErrorCodes.TIMEOUT,
+                        broker="iqoption",
+                    )
+
+                self._connected = True
+                self._authenticated = True
+
+                balance_mode = self._resolve_balance_mode(account_type)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self._api.change_balance, balance_mode),
+                        timeout=10.0,
+                    )
+                except Exception as e:
+                    print(f"[IQOption] change_balance({balance_mode}) failed: {e}")
+                    raise BrokerError(
+                        f"Failed to switch to {balance_mode} account",
+                        code=ErrorCodes.CONNECTION_FAILED,
+                        broker="iqoption",
+                        original_error=e,
+                    )
+
+                self._account_type = AccountType(account_type)
+
+                return {
+                    "status": ConnectionStatus.READY.value,
+                    "broker": "iqoption",
+                    "account_type": account_type,
+                    "balance_mode": balance_mode,
+                    "message": "Connected successfully",
+                }
+
+            except ImportError:
                 raise BrokerError(
-                    "Connection check timeout.",
-                    code=ErrorCodes.TIMEOUT,
+                    "iqoptionapi library not installed. Run: pip install iqoptionapi",
+                    code=ErrorCodes.NOT_SUPPORTED,
                     broker="iqoption",
                 )
-
-            self._connected = True
-            self._authenticated = True
-
-            balance_mode = self._resolve_balance_mode(account_type)
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._api.change_balance, balance_mode),
-                    timeout=10.0,
-                )
+            except BrokerError:
+                raise
             except Exception as e:
-                print(f"[IQOption] change_balance({balance_mode}) failed: {e}")
+                # Clean up on error
+                self._api = None
+                self._connected = False
+                self._authenticated = False
                 raise BrokerError(
-                    f"Failed to switch to {balance_mode} account",
+                    f"Connection error: {str(e)}",
                     code=ErrorCodes.CONNECTION_FAILED,
                     broker="iqoption",
                     original_error=e,
                 )
-
-            self._account_type = AccountType(account_type)
-
-            return {
-                "status": ConnectionStatus.READY.value,
-                "broker": "iqoption",
-                "account_type": account_type,
-                "balance_mode": balance_mode,
-                "message": "Connected successfully",
-            }
-
-        except ImportError:
-            raise BrokerError(
-                "iqoptionapi library not installed. Run: pip install iqoptionapi",
-                code=ErrorCodes.NOT_SUPPORTED,
-                broker="iqoption",
-            )
-        except BrokerError:
-            raise
-        except Exception as e:
-            # Clean up on error
-            self._api = None
-            self._connected = False
-            self._authenticated = False
-            raise BrokerError(
-                f"Connection error: {str(e)}",
-                code=ErrorCodes.CONNECTION_FAILED,
-                broker="iqoption",
-                original_error=e,
-            )
 
     async def disconnect(self) -> None:
         """Desconecta do IQ Option"""
