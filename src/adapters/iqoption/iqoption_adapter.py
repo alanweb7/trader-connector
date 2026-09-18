@@ -21,6 +21,9 @@ from ...core.models import (
     OrderDirection,
     OrderRequest,
     OrderResponse,
+    OrderResult,
+    OrderResultType,
+    OrderStatus,
 )
 from ...core.errors import BrokerError, ErrorCodes
 
@@ -36,6 +39,8 @@ class IQOptionAdapter(BrokerAdapter):
         self._api = None
         self._connected = False
         self._authenticated = False
+        self._last_order_amounts: Dict[str, float] = {}
+        self._wait_result_timeout_sec = 380.0
         self._account_type = AccountType.PRACTICE
         self._subscriptions: Dict[str, Dict[str, Any]] = {}
         self._email: Optional[str] = None
@@ -500,6 +505,7 @@ class IQOptionAdapter(BrokerAdapter):
 
             if result and result[0]:
                 order_id = str(result[1])
+                self._last_order_amounts[order_id] = float(order.amount or 0.0)
                 return OrderResponse(
                     id=order_id,
                     status=OrderStatus.ACCEPTED,
@@ -543,6 +549,101 @@ class IQOptionAdapter(BrokerAdapter):
             code=ErrorCodes.NOT_SUPPORTED,
             broker="iqoption",
         )
+
+    async def get_order(self, order_id: str) -> OrderResponse:
+        """
+        Obtém status de uma ordem binária.
+
+        USA check_win_v4 da lib (socket_option_closed): enquanto a opção
+        está em aberto, retorna PENDING; quando fecha, retorna CLOSED.
+        """
+        self._ensure_connected()
+
+        result = self._query_order_result_blocking(order_id)
+        if result is not None:
+            return OrderResponse(
+                id=order_id,
+                status=OrderStatus.CLOSED,
+                broker="iqoption",
+            )
+        return OrderResponse(
+            id=order_id,
+            status=OrderStatus.OPEN,
+            broker="iqoption",
+        )
+
+    async def get_order_result(self, order_id: str) -> OrderResult:
+        """
+        Obtém o resultado final (WIN/LOSS/DRAW) de uma ordem binária.
+
+        Bloqueia (em thread separada) até a opção fechar via check_win_v4.
+        Múltiplas consultas simultâneas para o mesmo id são ok: cada thread
+        espera o payload do WebSocket e as seguintes retornam instantâneas.
+        """
+        self._ensure_connected()
+        return self._query_order_result_blocking(order_id)
+
+    def _query_order_result_blocking(self, order_id: str) -> OrderResult:
+        """
+        Chama check_win_v4 (bloqueante até o fechamento) e mapeia
+        ('win'|'loose'|'equal', profit) para OrderResult.
+        """
+        import threading
+
+        holder: Dict[str, Any] = {"error": None, "payload": None}
+        done = threading.Event()
+
+        def _worker():
+            try:
+                win, profit = self._api.check_win_v4(order_id)
+                holder["win"] = win
+                holder["profit"] = profit
+            except Exception as exc:  # pragma: no cover - lib interna
+                holder["error"] = exc
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
+        # Não trava o event loop indefinidamente: espera até 6min + folga
+        if not done.wait(timeout=(self._wait_result_timeout_sec)):
+            raise BrokerError(
+                "Timed out waiting for order result",
+                code=ErrorCodes.TIMEOUT,
+                broker="iqoption",
+            )
+
+        if holder.get("error"):
+            raise BrokerError(
+                f"Failed to get order result: {holder['error']}",
+                code=ErrorCodes.UNKNOWN_ERROR,
+                broker="iqoption",
+                original_error=holder["error"],
+            )
+
+        win = str(holder.get("win", "")).lower()
+        profit = float(holder.get("profit") or 0.0)
+
+        if win == "win":
+            result_type = OrderResultType.WIN
+        elif win == "loose":
+            result_type = OrderResultType.LOSS
+        else:
+            result_type = OrderResultType.DRAW
+
+        request = OrderResult(
+            order_id=order_id,
+            status=OrderStatus.CLOSED,
+            result=result_type,
+            profit=profit,
+            payout=round(profit / self._last_amount(order_id) * 100, 2) if profit and self._last_amount(order_id) else 0.0,
+        )
+        return request
+
+    def _last_amount(self, order_id: str) -> float:
+        """Valor apostado na ordem (armazenado em place_order) para derivar payout."""
+        return self._last_order_amounts.get(order_id, 0.0)
 
     def _ensure_connected(self) -> None:
         """Verifica se está conectado"""
