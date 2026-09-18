@@ -93,12 +93,29 @@ class IQOptionAdapter(BrokerAdapter):
 
             self._connected = True
             self._authenticated = True
+
+            balance_mode = self._resolve_balance_mode(account_type)
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._api.change_balance, balance_mode),
+                    timeout=10.0,
+                )
+            except Exception as e:
+                print(f"[IQOption] change_balance({balance_mode}) failed: {e}")
+                raise BrokerError(
+                    f"Failed to switch to {balance_mode} account",
+                    code=ErrorCodes.CONNECTION_FAILED,
+                    broker="iqoption",
+                    original_error=e,
+                )
+
             self._account_type = AccountType(account_type)
 
             return {
                 "status": ConnectionStatus.READY.value,
                 "broker": "iqoption",
                 "account_type": account_type,
+                "balance_mode": balance_mode,
                 "message": "Connected successfully",
             }
 
@@ -508,6 +525,21 @@ class IQOptionAdapter(BrokerAdapter):
                 code=ErrorCodes.CONNECTION_FAILED,
                 broker="iqoption",
             )
+
+    @staticmethod
+    def _resolve_balance_mode(account_type: str) -> str:
+        """
+        Mapeia AccountType interno (practice/demo/real) para o
+        Balance_MODE aceito pela iqoptionapi (PRACTICE | REAL | TOURNAMENT).
+        'demo' é tratado como 'practice' pois a IQ Option não tem conta demo
+        separada — apenas a conta virtual PRACTICE.
+        """
+        mode = (account_type or "practice").lower()
+        if mode in ("practice", "demo"):
+            return "PRACTICE"
+        if mode == "real":
+            return "REAL"
+        return "PRACTICE"
 
     async def _get_asset_data(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Obtém dados do ativo diretamente da API"""
