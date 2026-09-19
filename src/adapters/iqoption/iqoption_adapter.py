@@ -245,12 +245,17 @@ class IQOptionAdapter(BrokerAdapter):
     async def get_balance(self) -> Balance:
         """Obtém saldo da conta - lê do cache do WebSocket"""
         self._ensure_connected()
+        await self._ensure_live_session()
 
         try:
             amount = None
             try:
-                # get_balance() sem argumentos - assinatura correta
-                raw_balance = await asyncio.to_thread(self._api.get_balance)
+                # get_balance() tem while-loops da lib sem proteção — race com
+                # timeout próprio para não travar a rota quando a ws cai
+                raw_balance = await asyncio.wait_for(
+                    asyncio.to_thread(self._api.get_balance),
+                    timeout=15.0,
+                )
                 if raw_balance and isinstance(raw_balance, (int, float)):
                     amount = float(raw_balance)
             except Exception:
@@ -262,8 +267,7 @@ class IQOptionAdapter(BrokerAdapter):
                     import iqoptionapi.global_value as gv
                     raw = self._api.api.balances_raw
                     if raw is not None:
-                        obj_id = self._api.api.object_id
-                        current_balance_id = gv.balance_id.get(obj_id)
+                        current_balance_id = gv.balance_id
                         for bal in raw.get("msg", []):
                             if bal["id"] == current_balance_id:
                                 amount = float(bal["amount"])
@@ -528,14 +532,11 @@ class IQOptionAdapter(BrokerAdapter):
             # OTC não encontrado no book: segue a operação mesmo assim e
             # deixa a IQ Option responder (rejeição real, se houver).
 
-            # Converter direção
-            direction = 1 if order.direction == OrderDirection.CALL else 0
+            # Direção: buyv3 da lib faz direction.lower() esperando "call"/"put"
+            direction = "call" if order.direction == OrderDirection.CALL else "put"
 
-            # Enviar ordem - assinatura correta: buy(price, ACTIVES, ACTION, expirations)
-            # price: valor da aposta, ACTIVES: ativo, ACTION: 1=CALL 0=PUT, expirations: tempo
-            result = await asyncio.to_thread(
-                self._api.buy, order.amount, order.asset, direction, order.expiration
-            )
+            result = await self._send_buy(order.amount, order.asset, direction, order.expiration)
+            print(f"[IQOption] buy raw result={result!r}", flush=True)
 
             if result and result[0]:
                 order_id = str(result[1])
@@ -549,13 +550,19 @@ class IQOptionAdapter(BrokerAdapter):
                     idempotency_key=order.idempotency_key,
                 )
             else:
+                # buy() devolve (False, message) — preservar o motivo real
+                # (ex: 'insufficient balance', 'asset expired', etc.)
+                reason = None
+                if isinstance(result, (list, tuple)) and len(result) > 1:
+                    reason = str(result[1]) if result[1] is not None else None
+                print(f"[IQOption] order rejected for {order.asset}: reason={reason!r}")
                 return OrderResponse(
                     status=OrderStatus.REJECTED,
                     broker="iqoption",
                     connection_id=order.connection_id,
                     request_id=order.request_id,
                     idempotency_key=order.idempotency_key,
-                    error="Order rejected by broker",
+                    error=reason or "Order rejected by broker (sem mensagem do broker)",
                 )
 
         except BrokerError:
@@ -567,6 +574,54 @@ class IQOptionAdapter(BrokerAdapter):
                 broker="iqoption",
                 original_error=e,
             )
+
+    async def _send_buy(
+        self,
+        amount: float,
+        symbol: str,
+        direction: str,
+        expiration: int,
+    ) -> tuple:
+        """
+        Envia uma ordem binária com janela de ACK própria (12s).
+
+        O stable_api.buy() da lib desiste em 5s ('buy late 5 sec') mesmo
+        quando a IQ Option processa a ordem — causando falsas rejeições.
+        Replicamos o mesmo fluxo (buyv3 + buy_multi_option) com espera
+        mais longa:
+          - (True, order_id) quando o ws devolve a posição
+          - (False, message) quando o broker devolve erro explícito
+          - (False, None) se estourar a janela
+        """
+        import random
+
+        req_id = str(random.randint(100000, 999999))
+        api_raw = self._api.api
+
+        def _send():
+            from iqoptionapi import OP_code as _OP
+
+            active_id = _OP.ACTIVES.get(symbol)
+            if active_id is None:
+                raise BrokerError(
+                    f"Unknown active: {symbol}",
+                    code=ErrorCodes.ASSET_NOT_FOUND,
+                    broker="iqoption",
+                )
+            api_raw.buyv3(float(amount), active_id, direction, int(expiration), req_id)
+
+        api_raw.buy_multi_option = {req_id: {}}
+        await asyncio.to_thread(_send)
+
+        deadline = asyncio.get_event_loop().time() + 12.0
+        while asyncio.get_event_loop().time() < deadline:
+            payload = api_raw.buy_multi_option.get(req_id) or {}
+            if payload.get("id"):
+                return True, str(payload["id"])
+            if payload.get("message"):
+                return False, payload["message"]
+            await asyncio.sleep(0.2)
+        return False, None
 
     async def cancel_order(self, order_id: str) -> None:
         """
@@ -584,6 +639,28 @@ class IQOptionAdapter(BrokerAdapter):
             broker="iqoption",
         )
 
+    async def _ensure_live_session(self) -> None:
+        """
+        Garante WebSocket vivo para leituras dependentes de socket
+        (ex: check_win_v4). Reconecta UMA vez com as credenciais
+        armazenadas se a sessão caiu (login válido, não depende de
+        senha errada).
+        """
+        try:
+            alive = bool(await asyncio.to_thread(self._api.check_connect))
+        except Exception:
+            alive = False
+        if alive:
+            return
+
+        print("[IQOption] WebSocket morto ao consultar ordem — reconectando...", flush=True)
+        auth_type = self._account_type.value if hasattr(self._account_type, 'value') else str(self._account_type)
+        await self.connect({
+            "email": self._email,
+            "password": self._password,
+            "account_type": auth_type,
+        })
+
     async def get_order(self, order_id: str) -> OrderResponse:
         """
         Obtém status de uma ordem binária.
@@ -592,6 +669,7 @@ class IQOptionAdapter(BrokerAdapter):
         está em aberto, retorna PENDING; quando fecha, retorna CLOSED.
         """
         self._ensure_connected()
+        await self._ensure_live_session()
 
         result = self._query_order_result_blocking(order_id)
         if result is not None:
@@ -615,6 +693,7 @@ class IQOptionAdapter(BrokerAdapter):
         espera o payload do WebSocket e as seguintes retornam instantâneas.
         """
         self._ensure_connected()
+        await self._ensure_live_session()
         return self._query_order_result_blocking(order_id)
 
     def _query_order_result_blocking(self, order_id: str) -> OrderResult:
@@ -624,7 +703,7 @@ class IQOptionAdapter(BrokerAdapter):
         """
         import threading
 
-        holder: Dict[str, Any] = {"error": None, "payload": None}
+        holder: Dict[str, Any] = {"error": None}
         done = threading.Event()
 
         def _worker():
@@ -666,14 +745,13 @@ class IQOptionAdapter(BrokerAdapter):
         else:
             result_type = OrderResultType.DRAW
 
-        request = OrderResult(
+        return OrderResult(
             order_id=order_id,
             status=OrderStatus.CLOSED,
             result=result_type,
             profit=profit,
             payout=round(profit / self._last_amount(order_id) * 100, 2) if profit and self._last_amount(order_id) else 0.0,
         )
-        return request
 
     def _last_amount(self, order_id: str) -> float:
         """Valor apostado na ordem (armazenado em place_order) para derivar payout."""
