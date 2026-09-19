@@ -127,18 +127,29 @@ class IQOptionAdapter(BrokerAdapter):
                 self._authenticated = True
 
                 balance_mode = self._resolve_balance_mode(account_type)
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(self._api.change_balance, balance_mode),
-                        timeout=10.0,
-                    )
-                except Exception as e:
-                    print(f"[IQOption] change_balance({balance_mode}) failed: {e}")
+                # change_balance depende do profile WS (get_profile_ansyc) que
+                # chega de forma assíncrona logo após o login — tentar 3x com
+                # backoff para não falhar por race de settle.
+                switched = False
+                last_err: Optional[Exception] = None
+                for attempt in range(3):
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(self._api.change_balance, balance_mode),
+                            timeout=10.0,
+                        )
+                        switched = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        print(f"[IQOption] change_balance({balance_mode}) tentativa {attempt + 1}/3 falhou: {e!r}", flush=True)
+                        await asyncio.sleep(2.0 * (attempt + 1))
+                if not switched:
                     raise BrokerError(
                         f"Failed to switch to {balance_mode} account",
                         code=ErrorCodes.CONNECTION_FAILED,
                         broker="iqoption",
-                        original_error=e,
+                        original_error=last_err,
                     )
 
                 self._account_type = AccountType(account_type)
