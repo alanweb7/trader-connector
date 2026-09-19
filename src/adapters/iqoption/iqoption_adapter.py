@@ -50,6 +50,60 @@ class IQOptionAdapter(BrokerAdapter):
         if IQOptionAdapter._login_lock is None:
             IQOptionAdapter._login_lock = asyncio.Lock()
 
+    @staticmethod
+    def _format_login_reason(reason: Optional[str]) -> str:
+        """
+        Traduz o motivo de falha de login da IQ Option para uma mensagem
+        clara em PT-BR, preservando o detalhe original. reason pode ser
+        JSON ('{"result":false,"message":"...","code":"..."}') ou texto.
+        """
+        raw = (reason or "").strip()
+        detail = ""
+        code = ""
+        message = ""
+        if raw:
+            try:
+                import json as _json
+                parsed = _json.loads(raw)
+                if isinstance(parsed, dict):
+                    code = str(parsed.get("code", "") or "")
+                    message = str(parsed.get("message", "") or "")
+            except Exception:
+                # texto cru da lib (ex: 'Websocket connection closed.')
+                message = raw
+            detail = message if message else raw
+
+        lowered = (code + " " + message).lower()
+
+        if ("invalid" in lowered or "wrong" in lowered or "incorrect" in lowered) and (
+            "credential" in lowered or "password" in lowered or "login" in lowered
+        ):
+            friendly = "E-mail ou senha incorretos. NÃO tente novamente sem confirmar as credenciais — tentativas repetidas bloqueiam seu IP."
+        elif "duplicate" in lowered:
+            friendly = "Sessão duplicada: esta conta já está conectada em outra sessão."
+        elif ("2fa" in lowered or "verify" in lowered or "sms" in lowered):
+            friendly = "Verificação 2FA/por e-mail exigida pela IQ Option."
+        elif "banned" in lowered or "block" in lowered:
+            friendly = "Conta ou IP bloqueado pela IQ Option. Aguarde antes de tentar novamente."
+        elif "too_many" in lowered or "too many" in lowered or "attempt" in lowered or "rate" in lowered or "limit" in lowered:
+            friendly = "Muitas tentativas de login — IP temporariamente bloqueado. Aguarde antes de tentar."
+        elif "maintenance" in lowered:
+            friendly = "IQ Option em manutenção no momento."
+        else:
+            try:
+                import iqoptionapi.global_value as _gv
+                ws_reason = getattr(_gv, "websocket_error_reason", None)
+            except Exception:
+                ws_reason = None
+            if raw and raw in ("Websocket connection closed.", ""):
+                friendly = "Falha de rede encontra a IQ Option (WebSocket não respondeu)."
+            elif ws_reason:
+                friendly = f"Falha no login (WebSocket): {ws_reason}"
+            else:
+                friendly = "Falha no login. Verifique rede/credenciais antes de tentar novamente."
+
+        return f"{friendly} [motivo: {detail or 'não informado pelo broker'}]" if detail else friendly
+
     async def connect(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conecta ao IQ Option.
@@ -92,15 +146,36 @@ class IQOptionAdapter(BrokerAdapter):
                 self._api = IQ_Option(self._email, self._password)
 
                 # Connect - roda em background thread, o while loop da lib
-                # pode demorar mas vai completar quando o WebSocket receber dados
+                # pode demorar mas vai completar quando o WebSocket receber dados.
+                # CAPTURA o retorno (ok, reason): o motivo real de falha de
+                # login vem aqui (senha errada, conta bloqueada, 2FA etc.) e
+                # NÃO pode ser descartado — evita retries cegos que bloqueiam
+                # o IP na corretora.
+                connect_ok = None
+                connect_reason: Optional[str] = None
                 try:
-                    await asyncio.wait_for(
+                    _ok, _reason = await asyncio.wait_for(
                         asyncio.to_thread(self._api.connect),
                         timeout=30.0,
                     )
+                    connect_ok = _ok
+                    connect_reason = _reason if isinstance(_reason, str) else None
                 except asyncio.TimeoutError:
                     # Timeout nos while loops internos, mas o WebSocket pode estar conectado
                     pass
+
+                if connect_ok is False:
+                    # Login negado pelo broker — surface o motivo real
+                    self._api = None
+                    self._connected = False
+                    self._authenticated = False
+                    reason = self._format_login_reason(connect_reason)
+                    print(f"[IQOption] login negado: {reason}", flush=True)
+                    raise BrokerError(
+                        reason,
+                        code=ErrorCodes.INVALID_CREDENTIALS,
+                        broker="iqoption",
+                    )
 
                 # Verificar se está conectado
                 try:
@@ -110,15 +185,20 @@ class IQOptionAdapter(BrokerAdapter):
                     )
                     if not is_connected:
                         self._api = None
+                        self._connected = False
+                        self._authenticated = False
+                        reason = self._format_login_reason(None)
                         raise BrokerError(
-                            "Failed to connect to IQ Option.",
+                            reason,
                             code=ErrorCodes.CONNECTION_FAILED,
                             broker="iqoption",
                         )
                 except asyncio.TimeoutError:
                     self._api = None
+                    self._connected = False
+                    self._authenticated = False
                     raise BrokerError(
-                        "Connection check timeout.",
+                        "Connection check timeout: IQ Option não confirmou o WebSocket em 30s.",
                         code=ErrorCodes.TIMEOUT,
                         broker="iqoption",
                     )
