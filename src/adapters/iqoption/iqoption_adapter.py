@@ -297,31 +297,56 @@ class IQOptionAdapter(BrokerAdapter):
         try:
             # Obter ativos abertos - assinatura correta: get_all_open_time() sem args
             assets = []
+            seen: Dict[str, Asset] = {}
             try:
-                all_assets = await asyncio.to_thread(self._api.get_all_open_time)
-            except Exception:
+                all_assets = await asyncio.wait_for(
+                    asyncio.to_thread(self._api.get_all_open_time),
+                    timeout=25.0,
+                )
+            except asyncio.TimeoutError:
                 all_assets = None
 
             # Verificar se retornou dados validos
-            if all_assets is None:
-                # Mercado pode estar fechado - retornar lista vazia
+            if not isinstance(all_assets, dict):
                 return assets
 
-            if isinstance(all_assets, dict) and "turbo" in all_assets:
-                for symbol, data in all_assets["turbo"].items():
-                    if isinstance(data, dict):
-                        asset = Asset(
+            # Agregar buckets de opções binárias (turbo/binary/digital).
+            # OTC geralmente está em "binary"; prioridade ao bucket com open=True.
+            for bucket in ("turbo", "binary", "digital"):
+                entries = all_assets.get(bucket)
+                if not isinstance(entries, dict):
+                    continue
+                for symbol, data in entries.items():
+                    if not isinstance(data, dict):
+                        continue
+                    is_open = bool(data.get("open", False))
+                    payout = float(data.get("payout", 0) or 0)
+                    existing = seen.get(symbol)
+                    if existing is None:
+                        seen[symbol] = Asset(
                             symbol=symbol,
                             name=symbol,
                             type=AssetType.BINARY,
-                            status=AssetStatus.OPEN if data.get("open", False) else AssetStatus.CLOSED,
-                            payout=data.get("payout", 0),
+                            status=AssetStatus.OPEN if is_open else AssetStatus.CLOSED,
+                            payout=payout,
                             min_amount=1,
                             max_amount=1000,
                             expiration=[1, 5],
                         )
-                        assets.append(asset)
+                    elif is_open and not existing.status == AssetStatus.OPEN:
+                        # Bucket posterior confirma aberto — atualizar status/payout
+                        seen[symbol] = Asset(
+                            symbol=symbol,
+                            name=symbol,
+                            type=AssetType.BINARY,
+                            status=AssetStatus.OPEN,
+                            payout=max(payout, existing.payout),
+                            min_amount=1,
+                            max_amount=1000,
+                            expiration=[1, 5],
+                        )
 
+            assets = list(seen.values())
             return assets
 
         except Exception as e:
@@ -345,9 +370,8 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
 
         try:
-            all_assets = await asyncio.to_thread(self._api.get_all_open_time)
-            if all_assets and "turbo" in all_assets and symbol in all_assets["turbo"]:
-                data = all_assets["turbo"][symbol]
+            data = await self._get_asset_data(symbol)
+            if isinstance(data, dict):
                 return Asset(
                     symbol=symbol,
                     name=symbol,
@@ -487,12 +511,22 @@ class IQOptionAdapter(BrokerAdapter):
         try:
             # Verificar se ativo está aberto
             asset_data = await self._get_asset_data(order.asset)
-            if not asset_data or not asset_data.get("open", False):
+            if asset_data and not asset_data.get("open", False):
                 raise BrokerError(
                     f"Asset {order.asset} is closed",
                     code=ErrorCodes.MARKET_CLOSED,
                     broker="iqoption",
                 )
+            if asset_data is None and not self._is_otc(order.asset):
+                # Ativo regular não encontrado no book em nenhum bucket:
+                # tratar como fechado para falhar rápido e claro.
+                raise BrokerError(
+                    f"Asset {order.asset} not found or market closed",
+                    code=ErrorCodes.MARKET_CLOSED,
+                    broker="iqoption",
+                )
+            # OTC não encontrado no book: segue a operação mesmo assim e
+            # deixa a IQ Option responder (rejeição real, se houver).
 
             # Converter direção
             direction = 1 if order.direction == OrderDirection.CALL else 0
@@ -697,11 +731,46 @@ class IQOptionAdapter(BrokerAdapter):
         return f"Connection error: {msg}"
 
     async def _get_asset_data(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Obtém dados do ativo diretamente da API"""
+        """
+        Obtém dados de abertura do ativo em múltiplos buckets.
+
+        get_all_open_time() retorna: {"binary": {...}, "turbo": {...},
+        "digital": {...}, "cfd": {...}, "forex": {...}, ...} e pares OTC
+        frequentemente aparecem em "binary" (não só em "turbo").
+        Preferência: primeiro registro com open=True entre os buckets;
+        se o ativo existir apenas com open=False, retorna esse registro
+        (o chamador decide rejeitar).
+
+        Nota: a lib tem um bug em que chunk de dados digital não chega e
+        o loop interno trava — por isso a chamada roda com timeout e,
+        expirando, devolvemos None (o chamador decide o fallback).
+        """
         try:
-            all_assets = await asyncio.to_thread(self._api.get_all_open_time)
-            if all_assets and "turbo" in all_assets and symbol in all_assets["turbo"]:
-                return all_assets["turbo"][symbol]
+            all_assets = await asyncio.wait_for(
+                asyncio.to_thread(self._api.get_all_open_time),
+                timeout=25.0,
+            )
+            if not isinstance(all_assets, dict):
+                return None
+
+            fallback: Optional[Dict[str, Any]] = None
+            for bucket in ("turbo", "binary", "digital"):
+                entries = all_assets.get(bucket)
+                if not isinstance(entries, dict) or symbol not in entries:
+                    continue
+                data = entries.get(symbol)
+                if not isinstance(data, dict):
+                    continue
+                if data.get("open", False):
+                    return data
+                if fallback is None:
+                    fallback = data
+            return fallback
+        except asyncio.TimeoutError:
+            return None
         except Exception:
-            pass
-        return None
+            return None
+
+    def _is_otc(self, symbol: str) -> bool:
+        """Assets '-OTC' da IQ Option têm mercado permanente (não seguem o horário)."""
+        return symbol.strip().upper().endswith("-OTC")
