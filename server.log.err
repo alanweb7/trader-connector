@@ -1,0 +1,170 @@
+INFO:     Started server process [19084]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+ERROR:root:**warning** get_digital_underlying_list_data late 30 sec
+Exception in thread Thread-3 (__get_digital_open):
+Traceback (most recent call last):
+  File "C:\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 306, in __get_digital_open
+    digital_data = self.get_digital_underlying_list_data()["underlying"]
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+TypeError: 'NoneType' object is not subscriptable
+ERROR:root:**warning** get_digital_underlying_list_data late 30 sec
+Exception in thread Thread-6 (__get_digital_open):
+Traceback (most recent call last):
+  File "C:\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 306, in __get_digital_open
+    digital_data = self.get_digital_underlying_list_data()["underlying"]
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+TypeError: 'NoneType' object is not subscriptable
+INFO:     192.168.3.31:9742 - "WebSocket /" 403
+INFO:     connection rejected (403 Forbidden)
+ERROR:root:**warning** get_digital_underlying_list_data late 30 sec
+Exception in thread Thread-38 (__get_digital_open):
+Traceback (most recent call last):
+  File "C:\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 306, in __get_digital_open
+    digital_data = self.get_digital_underlying_list_data()["underlying"]
+                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+TypeError: 'NoneType' object is not subscriptable
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:'NoneType' object has no attribute 'is_ssl'
+Exception in thread Thread-39 (__get_other_open):
+ERROR:root:**error** api.get_instruments need reconnect
+Traceback (most recent call last):
+  File "C:\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 321, in __get_other_open
+    ins_data = self.get_instruments(instruments_type)["instruments"]
+               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 219, in get_instruments
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 142, in connect
+    if json.loads(reason)['code'] == 'verify':
+       ~~~~~~~~~~^^^^^^^^
+  File "C:\Python314\Lib\json\__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Python314\Lib\json\decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\json\decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+ERROR:iqoptionapi.ws.client:'NoneType' object has no attribute 'is_ssl'
+Exception in thread Thread-4 (__get_other_open):
+Traceback (most recent call last):
+  File "C:\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 321, in __get_other_open
+    ins_data = self.get_instruments(instruments_type)["instruments"]
+               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 219, in get_instruments
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 142, in connect
+    if json.loads(reason)['code'] == 'verify':
+       ~~~~~~~~~~^^^^^^^^
+  File "C:\Python314\Lib\json\__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Python314\Lib\json\decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\json\decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+INFO:     192.168.3.31:5136 - "WebSocket /" 403
+INFO:     connection rejected (403 Forbidden)
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:[WinError 10054] Foi forçado o cancelamento de uma conexão existente pelo host remoto
+ERROR:root:**error** api.get_instruments need reconnect
+ERROR:iqoptionapi.ws.client:Handshake status 307 None
+Exception in thread Thread-7 (__get_other_open):
+Traceback (most recent call last):
+  File "C:\Python314\Lib\threading.py", line 1082, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Python314\Lib\threading.py", line 1024, in run
+    self._target(*self._args, **self._kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 321, in __get_other_open
+    ins_data = self.get_instruments(instruments_type)["instruments"]
+               ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 219, in get_instruments
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "E:\apps\01 - TRADER\CONNECTOR\venv\Lib\site-packages\iqoptionapi\stable_api.py", line 142, in connect
+    if json.loads(reason)['code'] == 'verify':
+       ~~~~~~~~~~^^^^^^^^
+  File "C:\Python314\Lib\json\__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Python314\Lib\json\decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\json\decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
