@@ -122,30 +122,6 @@ app.add_middleware(
 )
 
 
-# ----------------------------------------------------------------------------------------------------------------
-# Sessão única ativa
-#
-# A lib iqoptionapi mantém estado global compartilhado (iqoptionapi.global_value:
-# SSID, balance_id, exclusão mútua ssl) e não suporta múltiplos WebSockets vivos.
-# Duas sessões "ready" simultâneas dão WinError 10054 (host derruba a conexão) e
-# os logins subsequentes falham como se fossem senha errada. Antes de conectar um
-# adapter, encerramos as sessões vivas dos demais adapters (sessão única ativa).
-async def disconnect_other_active_sessions(current_connection_id: str) -> None:
-    for conn in list(broker_registry.list_connections()):
-        other_id = str(conn.id)
-        if other_id == current_connection_id:
-            continue
-        other_adapter = broker_registry.get_adapter_for_connection(other_id)
-        if other_adapter is not None and getattr(other_adapter, "_connected", False):
-            try:
-                await other_adapter.disconnect()
-                conn.status = ConnectionStatus.DISCONNECTED
-                connection_repository.update_status(other_id, "disconnected")
-                print(f"[BrokerGateway] Sessão anterior encerrada para liberar login: {other_id}", flush=True)
-            except Exception as e:
-                print(f"[BrokerGateway] Falha ao encerrar sessão de {other_id}: {e}", flush=True)
-
-
 # Rotas de health check
 @app.get("/health")
 async def health_check():
@@ -242,7 +218,6 @@ async def create_connection(config: ConnectRequest):
         adapter = broker_registry.get_adapter_for_connection(connection_id)
         if not adapter:
             raise HTTPException(status_code=500, detail="Adapter not initialized")
-        await disconnect_other_active_sessions(connection_id)
         result = await adapter.connect({
             "email": config.email,
             "password": config.password,
@@ -437,9 +412,6 @@ async def connect_connection(connection_id: str):
     db_conn = connection_repository.get_with_credentials(connection_id)
     if not db_conn:
         raise HTTPException(status_code=400, detail="Credentials not found")
-
-    # Sessão única ativa: encerra ws vivos de outros adapters antes do login
-    await disconnect_other_active_sessions(connection_id)
 
     # Update status
     connection.status = ConnectionStatus.CONNECTING
