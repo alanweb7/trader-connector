@@ -31,14 +31,11 @@ from ...core.errors import BrokerError, ErrorCodes
 class IQOptionAdapter(BrokerAdapter):
     """Adapter para IQ Option"""
 
-    # Lock global para serializar logins (lib iqoptionapi usa module-level globals
-    # que não suportam múltiplas sessões simultâneas). Conexões são feitas uma por vez.
-    _login_lock: Optional[asyncio.Lock] = None
-
     def __init__(self):
         self._api = None
         self._connected = False
         self._authenticated = False
+        self._login_lock: asyncio.Lock = asyncio.Lock()
         self._last_order_amounts: Dict[str, float] = {}
         self._wait_result_timeout_sec = 380.0
         self._account_type = AccountType.PRACTICE
@@ -47,11 +44,8 @@ class IQOptionAdapter(BrokerAdapter):
         self._password: Optional[str] = None
         self._cached_balance = 0.0
         self._cached_profile = {}
-        if IQOptionAdapter._login_lock is None:
-            IQOptionAdapter._login_lock = asyncio.Lock()
 
-    @staticmethod
-    def _format_login_reason(reason: Optional[str]) -> str:
+    def _format_login_reason(self, reason: Optional[str]) -> str:
         """
         Traduz o motivo de falha de login da IQ Option para uma mensagem
         clara em PT-BR, preservando o detalhe original. reason pode ser
@@ -90,11 +84,7 @@ class IQOptionAdapter(BrokerAdapter):
         elif "maintenance" in lowered:
             friendly = "IQ Option em manutenção no momento."
         else:
-            try:
-                import iqoptionapi.global_value as _gv
-                ws_reason = getattr(_gv, "websocket_error_reason", None)
-            except Exception:
-                ws_reason = None
+            ws_reason = self._get_ws_error_reason()
             if raw and raw in ("Websocket connection closed.", ""):
                 friendly = "Falha de rede encontra a IQ Option (WebSocket não respondeu)."
             elif ws_reason:
@@ -104,25 +94,32 @@ class IQOptionAdapter(BrokerAdapter):
 
         return f"{friendly} [motivo: {detail or 'não informado pelo broker'}]" if detail else friendly
 
+    def _get_ws_error_reason(self) -> Optional[str]:
+        """Lê websocket_error_reason do estado indexado por object_id (fork victalejo)."""
+        try:
+            import iqoptionapi.global_value as _gv
+            if isinstance(_gv.websocket_error_reason, dict):
+                if self._api and getattr(self._api.api, "object_id", None) is not None:
+                    return _gv.websocket_error_reason.get(self._api.api.object_id)
+                return next((v for v in _gv.websocket_error_reason.values() if v), None)
+            return getattr(_gv, "websocket_error_reason", None)
+        except Exception:
+            return None
+
     async def connect(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conecta ao IQ Option.
 
-        IMPORTANTE: a lib iqoptionapi usa globals em `iqoptionapi.global_value`
-        (SSID, balance_id) que são compartilhados por todas as instâncias IQ_Option.
-        Isso significa que múltiplas conexões simultâneas não funcionam — uma
-        segunda conexão reusa o SSID da primeira (api.py:847-850).
+        A lib iqoptionapi (fork victalejo) indexa o estado global por
+        object_id/id(wss) — cada instância IQ_Option mantém SSID, balance_id,
+        locks e buffers próprios. Múltiplas sessões simultâneas são suportadas.
 
-        Para suportar múltiplos usuários sequencialmente:
-        1. Lock global garante que apenas UM login ocorre por vez
-        2. Resetamos os globals ANTES de criar o novo IQ_Option, forçando
-           re-autenticação com as credenciais novas
-        3. Fechamos explicitamente o WebSocket anterior para limpar estado
+        O lock por instância evita apenas connect() concorrente na MESMA
+        instância (ex: auto-reconnect disputando com um connect manual).
         """
         async with self._login_lock:
             try:
                 from iqoptionapi.stable_api import IQ_Option
-                import iqoptionapi.global_value as gv
 
                 self._email = config.get("email")
                 self._password = config.get("password")
@@ -134,14 +131,6 @@ class IQOptionAdapter(BrokerAdapter):
                         code=ErrorCodes.INVALID_CREDENTIALS,
                         broker="iqoption",
                     )
-
-                # Resetar globals da lib — sem isso, IQ_Option.connect() reusa o SSID
-                # da sessão anterior (api.py:847-850: "doing temp ssid reconnect for speed up")
-                gv.SSID = None
-                gv.balance_id = None
-                gv.check_websocket_if_connect = None
-                gv.check_websocket_if_error = False
-                gv.websocket_error_reason = None
 
                 self._api = IQ_Option(self._email, self._password)
 
@@ -358,7 +347,11 @@ class IQOptionAdapter(BrokerAdapter):
                     import iqoptionapi.global_value as gv
                     raw = self._api.api.balances_raw
                     if raw is not None:
-                        current_balance_id = gv.balance_id
+                        oid = getattr(self._api.api, "object_id", None)
+                        if isinstance(gv.balance_id, dict) and oid is not None:
+                            current_balance_id = gv.balance_id.get(oid)
+                        else:
+                            current_balance_id = gv.balance_id
                         for bal in raw.get("msg", []):
                             if bal["id"] == current_balance_id:
                                 amount = float(bal["amount"])
@@ -762,7 +755,7 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
         await self._ensure_live_session()
 
-        result = self._query_order_result_blocking(order_id)
+        result = await self._query_order_result_blocking(order_id)
         if result is not None:
             return OrderResponse(
                 id=order_id,
@@ -785,12 +778,14 @@ class IQOptionAdapter(BrokerAdapter):
         """
         self._ensure_connected()
         await self._ensure_live_session()
-        return self._query_order_result_blocking(order_id)
+        return await self._query_order_result_blocking(order_id)
 
-    def _query_order_result_blocking(self, order_id: str) -> OrderResult:
+    async def _query_order_result_blocking(self, order_id: str) -> OrderResult:
         """
         Chama check_win_v4 (bloqueante até o fechamento) e mapeia
         ('win'|'loose'|'equal', profit) para OrderResult.
+        O wait roda em thread para não congelar o event loop (as demais
+        sessões continuam respondendo enquanto uma aguarda resultado).
         """
         import threading
 
@@ -814,8 +809,9 @@ class IQOptionAdapter(BrokerAdapter):
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()
 
-        # Não trava o event loop indefinidamente: espera até 6min + folga
-        if not done.wait(timeout=(self._wait_result_timeout_sec)):
+        # Espera em thread separada para não bloquear o event loop
+        finished = await asyncio.to_thread(done.wait, self._wait_result_timeout_sec)
+        if not finished:
             raise BrokerError(
                 "Timed out waiting for order result",
                 code=ErrorCodes.TIMEOUT,
@@ -888,9 +884,13 @@ class IQOptionAdapter(BrokerAdapter):
         Traduz esses casos para uma mensagem útil.
         """
         msg = str(e)
+        reason = None
         try:
             import iqoptionapi.global_value as _gv
-            reason = getattr(_gv, "websocket_error_reason", None)
+            if isinstance(_gv.websocket_error_reason, dict):
+                reason = next((v for v in _gv.websocket_error_reason.values() if v), None)
+            else:
+                reason = getattr(_gv, "websocket_error_reason", None)
         except Exception:
             reason = None
 

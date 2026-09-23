@@ -4,7 +4,11 @@ Execute: python scripts/test_api.py
 """
 import httpx
 import json
+import os
 import sys
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 BASE_URL = "http://localhost:8000"
 
