@@ -8,23 +8,25 @@ echo ============================================================
 echo           BROKER GATEWAY - MENU PRINCIPAL
 echo ============================================================
 echo.
-echo   [1] Iniciar Servidor (porta 8000)
-echo   [2] Rodar Testes da API
-echo   [3] Testar Conexao IQ Option
-echo   [4] Abrir Docs da API (navegador)
-echo   [5] Instalar Dependencias
-echo   [6] Parar Servidor
+echo   [1] Iniciar Servidor (segundo plano)
+echo   [2] Reiniciar Servidor
+echo   [3] Rodar Testes da API
+echo   [4] Testar Conexao IQ Option
+echo   [5] Abrir Docs da API (navegador)
+echo   [6] Instalar Dependencias
+echo   [7] Parar Servidor
 echo   [0] Sair
 echo.
 echo ============================================================
 set /p opcao="Escolha uma opcao: "
 
 if "%opcao%"=="1" goto INICIAR_SERVIDOR
-if "%opcao%"=="2" goto RODAR_TESTES
-if "%opcao%"=="3" goto TESTAR_IQOPTION
-if "%opcao%"=="4" goto ABRIR_DOCS
-if "%opcao%"=="5" goto INSTALAR
-if "%opcao%"=="6" goto PARAR_SERVIDOR
+if "%opcao%"=="2" goto REINICIAR_SERVIDOR
+if "%opcao%"=="3" goto RODAR_TESTES
+if "%opcao%"=="4" goto TESTAR_IQOPTION
+if "%opcao%"=="5" goto ABRIR_DOCS
+if "%opcao%"=="6" goto INSTALAR
+if "%opcao%"=="7" goto PARAR_SERVIDOR
 if "%opcao%"=="0" goto SAIR
 
 echo Opcao invalida!
@@ -33,12 +35,39 @@ goto MENU
 
 :INICIAR_SERVIDOR
 cls
-echo Iniciando servidor...
+echo Verificando se ja esta rodando...
+tasklist /FI "WINDOWTITLE eq Broker Gateway*" 2>nul | find /I "python.exe" >nul
+if %errorlevel%==0 (
+    echo Servidor ja esta rodando!
+    echo Acesse: http://localhost:8000
+) else (
+    echo Iniciando servidor em segundo plano...
+    cd /d "%~dp0"
+    call venv\Scripts\activate.bat
+    start /B "Broker Gateway" python -m src.server >nul 2>&1
+    timeout /t 3 >nul
+    echo Servidor iniciado em http://localhost:8000
+)
+echo.
+pause
+goto MENU
+
+:REINICIAR_SERVIDOR
+cls
+echo Reiniciando servidor...
 cd /d "%~dp0"
+
+echo [1/2] Parando servidor existente...
+taskkill /F /IM python.exe /FI "WINDOWTITLE eq Broker Gateway*" >nul 2>&1
+taskkill /F /IM python.exe >nul 2>&1
+timeout /t 2 >nul
+
+echo [2/2] Iniciando servidor...
 call venv\Scripts\activate.bat
-start "Broker Gateway" cmd /k "python -m src.server"
+start /B "Broker Gateway" python -m src.server >nul 2>&1
 timeout /t 3 >nul
-echo Servidor iniciado em http://localhost:8000
+
+echo Servidor reiniciado em http://localhost:8000
 echo.
 pause
 goto MENU

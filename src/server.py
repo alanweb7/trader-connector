@@ -27,6 +27,7 @@ class ConnectRequest(BaseModel):
     password: str
     account_type: str = "practice"
     name: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class UpdateConnectionRequest(BaseModel):
@@ -186,11 +187,11 @@ async def list_brokers():
 
 # Rotas de conexões
 @app.get("/connections")
-async def list_connections():
-    """Lista conexões ativas"""
+async def list_connections(user_id: Optional[str] = None):
+    """Lista conexões (escopo multi-tenant via ?user_id=)"""
     # Get from database (includes persisted connections)
     try:
-        db_connections = connection_repository.list_all()
+        db_connections = connection_repository.list_all(user_id=user_id or None)
         return {"connections": db_connections}
     except Exception:
         # Fallback to in-memory registry
@@ -214,6 +215,7 @@ async def create_connection(config: ConnectRequest):
             email=config.email,
             password=config.password,
             account_type=config.account_type,
+            user_id=config.user_id or None,
         )
         connection_id = db_conn["id"]
 

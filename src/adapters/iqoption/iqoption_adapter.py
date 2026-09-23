@@ -690,7 +690,7 @@ class IQOptionAdapter(BrokerAdapter):
         api_raw = self._api.api
 
         def _send():
-            from iqoptionapi import OP_code as _OP
+            import iqoptionapi.constants as _OP
 
             active_id = _OP.ACTIVES.get(symbol)
             if active_id is None:
@@ -799,7 +799,11 @@ class IQOptionAdapter(BrokerAdapter):
 
         def _worker():
             try:
-                win, profit = self._api.check_win_v4(order_id)
+                # socket_option_closed é indexado pelo ID NUMÉRICO do ws
+                # (msg["id"] int) — passar string casara KeyError silencioso
+                # e a thread esperaria eternamente.
+                oid = int(order_id)
+                win, profit = self._api.check_win_v4(oid)
                 holder["win"] = win
                 holder["profit"] = profit
             except Exception as exc:  # pragma: no cover - lib interna
