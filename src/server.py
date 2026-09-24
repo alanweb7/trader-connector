@@ -1,9 +1,10 @@
 """
 Servidor principal do Broker Gateway
 """
+import asyncio
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -14,8 +15,10 @@ from pydantic import BaseModel
 from .core.models import Connection, ConnectionStatus, BrokerConfig, Account, Balance
 from .core.registry.broker_registry import broker_registry
 from .core.events.event_manager import event_manager
+from .core.errors import BrokerError
 from .adapters.iqoption import IQOptionAdapter
 from .infrastructure.database.connection_repository import connection_repository
+from .infrastructure.database.scheduled_order_repository import scheduled_order_repository
 
 # Carregar variáveis de ambiente
 load_dotenv()
@@ -52,6 +55,256 @@ class ErrorResponse(BaseModel):
 
 
 # Lifespan context manager
+async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) -> None:
+    """Reconecta automaticamente uma connection que estava ativa antes do restart."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            connection = broker_registry.get_connection(connection_id)
+            if not connection:
+                return
+            adapter = broker_registry.get_adapter_for_connection(connection_id)
+            if not adapter:
+                return
+            db_conn = connection_repository.get_with_credentials(connection_id)
+            if not db_conn or not db_conn.get("password"):
+                return
+
+            connection.status = ConnectionStatus.CONNECTING
+            connection_repository.update_status(connection_id, "connecting")
+            result = await adapter.connect({
+                "email": db_conn.get("email", ""),
+                "password": db_conn.get("password", ""),
+                "account_type": connection.account_type.value if hasattr(connection.account_type, "value") else connection.account_type,
+            })
+            connection.status = ConnectionStatus(result["status"])
+            connection_repository.update_status(connection_id, result["status"])
+            connection_repository.log_event(
+                "connection.reconnected",
+                connection_id=connection_id,
+                event_data={"status": result["status"], "auto": True},
+            )
+            print(f"[BrokerGateway] auto-reconnect OK: {connection_id}", flush=True)
+            return
+        except Exception as e:
+            print(
+                f"[BrokerGateway] auto-reconnect {connection_id} "
+                f"tentativa {attempt}/{max_attempts} falhou: {e}",
+                flush=True,
+            )
+            conn = broker_registry.get_connection(connection_id)
+            if conn:
+                conn.status = ConnectionStatus.ERROR
+            try:
+                connection_repository.update_status(connection_id, "error", str(e))
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                await asyncio.sleep(5 * attempt)
+
+
+# ---------------------------------------------------------------------------
+# Worker de ordens agendadas (abertura em horário fixo / próxima vela)
+# ---------------------------------------------------------------------------
+# Máximo de atraso aceito após scheduled_for — além disso marca 'missed'.
+SCHEDULED_GRACE_SEC = float(os.getenv("SCHEDULED_GRACE_SEC", "20"))
+# Intervalo de sincronização com o banco (novas linhas pending).
+SCHEDULED_POLL_SEC = float(os.getenv("SCHEDULED_POLL_SEC", "1.0"))
+
+_scheduled_tasks: "dict[str, asyncio.Task]" = {}
+
+
+async def _fire_scheduled_order(row: dict) -> None:
+    """
+    Espera até scheduled_for, reivindica a linha (claim atômico) e dispara
+    a ordem pelo mesmo caminho do endpoint manual (/connections/{id}/orders).
+    """
+    from .core.models import OrderRequest, OrderDirection, AccountType
+
+    order_id = row["id"]
+    try:
+        scheduled_for = datetime.fromisoformat(
+            str(row["scheduled_for"]).replace("Z", "+00:00")
+        )
+        if scheduled_for.tzinfo is None:
+            scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
+
+        delay = (scheduled_for - datetime.now(timezone.utc)).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+        # Claim atômico: só uma instância do worker dispara (pending → firing).
+        claimed = scheduled_order_repository.claim(order_id)
+        if not claimed:
+            return  # cancelada por usuário ou outra instância reivindicou
+
+        lateness = (datetime.now(timezone.utc) - scheduled_for).total_seconds()
+        if lateness > SCHEDULED_GRACE_SEC:
+            scheduled_order_repository.finish(
+                order_id,
+                "missed",
+                error=f"disparo atrasado {lateness:.1f}s > {SCHEDULED_GRACE_SEC:.0f}s (worker parado?)",
+            )
+            print(
+                f"[Scheduled] order {order_id} MISSED (atraso {lateness:.1f}s)",
+                flush=True,
+            )
+            return
+
+        connection = broker_registry.get_connection(row["connection_id"])
+        adapter = broker_registry.get_adapter_for_connection(row["connection_id"])
+        if not connection or not adapter:
+            scheduled_order_repository.finish(
+                order_id, "failed", error="conexão/adapter indisponível"
+            )
+            return
+
+        acct = connection.account_type
+        order_request = OrderRequest(
+            asset=row["asset"],
+            direction=OrderDirection(row["direction"].upper()),
+            amount=float(row["amount"]),
+            expiration=int(row.get("expiration") or 1),
+            account_type=AccountType(acct.value if hasattr(acct, "value") else acct),
+            connection_id=row["connection_id"],
+        )
+
+        db_order = connection_repository.save_order(
+            connection_id=row["connection_id"],
+            broker_order_id=None,
+            asset=order_request.asset,
+            direction=(
+                order_request.direction.value
+                if hasattr(order_request.direction, "value")
+                else str(order_request.direction)
+            ),
+            amount=order_request.amount,
+            expiration=order_request.expiration,
+            status="pending",
+        )
+
+        try:
+            result = await adapter.place_order(order_request)
+            final_status = (
+                result.status.value
+                if hasattr(result.status, "value")
+                else str(result.status)
+            )
+            connection_repository.update_order(
+                order_id=db_order["id"],
+                status=final_status,
+                broker_order_id=result.id,
+            )
+            connection_repository.log_event(
+                "order.scheduled_fired" if result.id else "order.scheduled_rejected",
+                connection_id=row["connection_id"],
+                event_data={
+                    "scheduled_order_id": order_id,
+                    "order_id": db_order["id"],
+                    "asset": order_request.asset,
+                    "status": final_status,
+                    "error": result.error,
+                },
+            )
+            if result.id and final_status == "accepted":
+                scheduled_order_repository.finish(
+                    order_id, "fired", broker_order_id=str(result.id)
+                )
+                dir_label = (
+                    order_request.direction.value
+                    if hasattr(order_request.direction, "value")
+                    else str(order_request.direction)
+                )
+                print(
+                    f"[Scheduled] order {order_id} FIRED -> broker {result.id} "
+                    f"({order_request.asset} {dir_label})",
+                    flush=True,
+                )
+            else:
+                scheduled_order_repository.finish(
+                    order_id, "rejected", error=result.error or "rejeitada pela corretora"
+                )
+                print(
+                    f"[Scheduled] order {order_id} REJECTED: {result.error}",
+                    flush=True,
+                )
+        except BrokerError as e:
+            connection_repository.update_order(
+                order_id=db_order["id"], status="rejected"
+            )
+            scheduled_order_repository.finish(order_id, "rejected", error=str(e))
+            print(f"[Scheduled] order {order_id} REJECTED: {e}", flush=True)
+
+    except asyncio.CancelledError:
+        # Shutdown no meio do caminho: não deixar linha presa em 'firing'.
+        try:
+            scheduled_order_repository.finish(
+                order_id, "failed", error="worker reiniciado durante o disparo"
+            )
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        try:
+            scheduled_order_repository.finish(order_id, "failed", error=str(e))
+        except Exception:
+            pass
+        print(f"[Scheduled] order {order_id} FAILED: {e}", flush=True)
+
+
+async def _scheduled_orders_worker() -> None:
+    """
+    Task periódica: sincroniza pending do banco e mantém uma task de disparo
+    por ordem (sleep até scheduled_for com precisão de ms).
+    """
+    print(
+        f"[BrokerGateway] scheduled-orders worker iniciado "
+        f"(poll={SCHEDULED_POLL_SEC}s grace={SCHEDULED_GRACE_SEC:.0f}s)",
+        flush=True,
+    )
+
+    # Linhas presas em 'firing' de um crash anterior → failed (nunca re-dispara
+    # sozinhas; o usuário pode reagendar).
+    try:
+        n = scheduled_order_repository.fail_firing("worker reiniciado antes do disparo")
+        if n:
+            print(f"[Scheduled] {n} linha(s) 'firing' órfãs marcadas como failed", flush=True)
+    except Exception as e:
+        print(f"[Scheduled] fail_firing error: {e}", flush=True)
+
+    try:
+        while True:
+            try:
+                rows = scheduled_order_repository.list(
+                    statuses=["pending"], limit=500
+                )
+                for row in rows:
+                    rid = row["id"]
+                    task = _scheduled_tasks.get(rid)
+                    if task and not task.done():
+                        continue
+                    _scheduled_tasks[rid] = asyncio.create_task(
+                        _fire_scheduled_order(row)
+                    )
+                # Limpa tasks concluídas
+                for rid in [
+                    k for k, t in _scheduled_tasks.items() if t.done()
+                ]:
+                    task = _scheduled_tasks.pop(rid, None)
+                    if task and not task.cancelled() and task.exception():
+                        print(
+                            f"[Scheduled] task {rid} exceção: {task.exception()}",
+                            flush=True,
+                        )
+            except Exception as e:
+                print(f"[Scheduled] sync error: {e}", flush=True)
+            await asyncio.sleep(SCHEDULED_POLL_SEC)
+    except asyncio.CancelledError:
+        # Cancela disparos em andamento (o handler marca 'failed')
+        for task in list(_scheduled_tasks.values()):
+            task.cancel()
+        raise
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gerencia o ciclo de vida da aplicação"""
@@ -76,13 +329,38 @@ async def lifespan(app: FastAPI):
             connection.id = conn["id"]
             connection.status = ConnectionStatus.DISCONNECTED
             broker_registry.register_connection(conn["id"], connection)
+
+        # Auto-reconnect: connections que estavam ativas antes do restart
+        # (status preservado no banco — ver shutdown abaixo).
+        active = [
+            c for c in db_connections
+            if c.get("status") in ("connected", "ready", "connecting")
+        ]
+        for conn in active:
+            asyncio.create_task(_auto_reconnect_connection(conn["id"]))
+        if active:
+            print(
+                f"[BrokerGateway] Auto-reconnect agendado para "
+                f"{len(active)} connection(s)",
+                flush=True,
+            )
     except Exception as e:
         print(f"[BrokerGateway] Warning: Could not load connections from database: {e}")
-    
+
+    # Worker de ordens agendadas (próxima vela / horário fixo)
+    scheduled_worker_task = asyncio.create_task(_scheduled_orders_worker())
+
     yield
     
     # Shutdown
     print("[BrokerGateway] Shutting down...")
+
+    # Para o worker de agendamento (disparos em andamento marcam 'failed')
+    scheduled_worker_task.cancel()
+    try:
+        await scheduled_worker_task
+    except (asyncio.CancelledError, Exception):
+        pass
     
     # Desconnect all active connections
     for connection in broker_registry.list_connections():
@@ -93,12 +371,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"[BrokerGateway] Error disconnecting {connection.id}: {e}")
     
-    # Update all connection statuses to disconnected in database
-    try:
-        for connection in broker_registry.list_connections():
-            connection_repository.update_status(connection.id, "disconnected")
-    except Exception as e:
-        print(f"[BrokerGateway] Error updating statuses: {e}")
+    # NB: NÃO marcar connections como 'disconnected' no banco aqui — o status
+    # preservado ("connected"/"ready") permite o auto-reconnect no próximo boot.
+    # Disconnect manual continua gravando 'disconnected' no endpoint.
     
     # Clear event history
     event_manager.clear_history()
@@ -700,6 +975,7 @@ async def place_order(connection_id: str, order: dict):
     if not adapter:
         raise HTTPException(status_code=400, detail="Not connected")
     
+    db_order = None
     try:
         order_request = OrderRequest(
             asset=order.get("asset"),
@@ -723,22 +999,40 @@ async def place_order(connection_id: str, order: dict):
         
         # Place order via broker
         result = await adapter.place_order(order_request)
-        
-        # Update order with broker ID and status
-        if result.id:
-            connection_repository.update_order(
-                order_id=db_order["id"],
-                status=result.status.value if hasattr(result.status, 'value') else result.status,
-            )
-        
-        connection_repository.log_event(
-            "order.placed",
-            connection_id=connection_id,
-            event_data={"order_id": db_order["id"], "asset": order_request.asset},
+
+        # Update order with broker ID/status (accepted OR rejected)
+        final_status = result.status.value if hasattr(result.status, 'value') else str(result.status)
+        connection_repository.update_order(
+            order_id=db_order["id"],
+            status=final_status,
+            broker_order_id=result.id,
         )
-        
+
+        connection_repository.log_event(
+            "order.placed" if result.id else "order.rejected",
+            connection_id=connection_id,
+            event_data={
+                "order_id": db_order["id"],
+                "asset": order_request.asset,
+                "status": final_status,
+                "error": result.error,
+            },
+        )
+
         return result.model_dump()
+    except HTTPException:
+        raise
     except Exception as e:
+        # Falha após salvar (ex: ativo fechado via BrokerError): marca a
+        # ordem como rejected para não ficar pending para sempre.
+        if db_order:
+            try:
+                connection_repository.update_order(
+                    order_id=db_order["id"],
+                    status="rejected",
+                )
+            except Exception:
+                pass
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -787,6 +1081,102 @@ async def get_order_result(connection_id: str, order_id: str):
         return result.model_dump()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+class ScheduledOrderCreate(BaseModel):
+    connection_id: str
+    asset: str
+    direction: str  # CALL | PUT
+    amount: float
+    expiration: int = 1
+    mode: str = "next_candle"  # next_candle | fixed_time
+    timeframe: Optional[str] = None
+    scheduled_for: str  # ISO UTC
+
+
+@app.post("/scheduled-orders")
+async def create_scheduled_order(body: ScheduledOrderCreate):
+    """Cria uma ordem agendada (worker dispara em scheduled_for)."""
+    connection = broker_registry.get_connection(body.connection_id)
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    if body.direction.upper() not in ("CALL", "PUT"):
+        raise HTTPException(status_code=400, detail="direction deve ser CALL ou PUT")
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="amount deve ser > 0")
+    if body.mode not in ("next_candle", "fixed_time"):
+        raise HTTPException(status_code=400, detail="mode inválido")
+
+    try:
+        dt = datetime.fromisoformat(body.scheduled_for.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="scheduled_for inválido (ISO)")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    ahead = (dt - datetime.now(timezone.utc)).total_seconds()
+    if ahead < 1.5:
+        raise HTTPException(
+            status_code=400,
+            detail="scheduled_for muito próximo (mínimo 1.5s no futuro)",
+        )
+
+    row = scheduled_order_repository.create(
+        connection_id=body.connection_id,
+        asset=body.asset,
+        direction=body.direction.upper(),
+        amount=body.amount,
+        expiration=body.expiration,
+        scheduled_for=dt.isoformat(),
+        mode=body.mode,
+        timeframe=body.timeframe,
+    )
+    connection_repository.log_event(
+        "order.scheduled_created",
+        connection_id=body.connection_id,
+        event_data={
+            "scheduled_order_id": row["id"],
+            "asset": body.asset,
+            "direction": body.direction.upper(),
+            "mode": body.mode,
+            "timeframe": body.timeframe,
+            "scheduled_for": dt.isoformat(),
+        },
+    )
+    return row
+
+
+@app.get("/scheduled-orders")
+async def list_scheduled_orders(
+    connection_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    """Lista ordens agendadas (opcionalmente por conexão/status)."""
+    rows = scheduled_order_repository.list(
+        connection_id=connection_id,
+        statuses=[status] if status else None,
+        limit=min(limit, 200),
+    )
+    return {"scheduled_orders": rows}
+
+
+@app.delete("/scheduled-orders/{order_id}")
+async def cancel_scheduled_order(order_id: str):
+    """Cancela uma ordem agendada (apenas se ainda pending)."""
+    if scheduled_order_repository.cancel(order_id):
+        connection_repository.log_event(
+            "order.scheduled_cancelled",
+            event_data={"scheduled_order_id": order_id},
+        )
+        return {"cancelled": True}
+    row = scheduled_order_repository.get_by_id(order_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+    raise HTTPException(
+        status_code=409,
+        detail=f"Não cancelável: status atual '{row.get('status')}'",
+    )
 
 
 @app.get("/events")

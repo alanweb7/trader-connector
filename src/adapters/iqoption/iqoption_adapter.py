@@ -44,6 +44,19 @@ class IQOptionAdapter(BrokerAdapter):
         self._password: Optional[str] = None
         self._cached_balance = 0.0
         self._cached_profile = {}
+        # Cache de get_all_init_v2 (turbo/binary actives) — evita bloquear
+        # ordens/assets no while-loop da lib (pode não responder na sessão longa).
+        self._init_v2_cache: Optional[Dict[str, Any]] = None
+        self._init_v2_cache_at: float = 0.0
+        self._init_v2_lock: asyncio.Lock = asyncio.Lock()
+        # Task periódica: mantém cache de ativos quente e detecta queda de
+        # sessão (auto-heal com backoff).
+        self._refresh_task: Optional[asyncio.Task] = None
+        import os as _os
+        try:
+            self._refresh_interval_sec = float(_os.environ.get("IQ_REFRESH_SEC", "300"))
+        except ValueError:
+            self._refresh_interval_sec = 300.0
 
     def _format_login_reason(self, reason: Optional[str]) -> str:
         """
@@ -223,6 +236,28 @@ class IQOptionAdapter(BrokerAdapter):
 
                 self._account_type = AccountType(account_type)
 
+                # Aquece cache de ativos logo após o login — sessões longas
+                # podem não responder a get-initialization-data de novo.
+                try:
+                    import time as _time
+                    warm = await asyncio.wait_for(
+                        asyncio.to_thread(self._api.get_all_init_v2, 0.2),
+                        timeout=10.0,
+                    )
+                    if isinstance(warm, dict) and warm:
+                        self._init_v2_cache = warm
+                        self._init_v2_cache_at = _time.time()
+                    print(
+                        f"[IQOption] init_v2 warmup "
+                        f"{'ok' if self._init_v2_cache else 'falhou'}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[IQOption] init_v2 warmup skip: {e!r}", flush=True)
+
+                # Task periódica: refresh de ativos + auto-heal da sessão
+                self._start_refresh_task()
+
                 return {
                     "status": ConnectionStatus.READY.value,
                     "broker": "iqoption",
@@ -253,6 +288,7 @@ class IQOptionAdapter(BrokerAdapter):
 
     async def disconnect(self) -> None:
         """Desconecta do IQ Option"""
+        await self._stop_refresh_task()
         if self._api:
             try:
                 await asyncio.to_thread(self._api.disconnect)
@@ -263,6 +299,144 @@ class IQOptionAdapter(BrokerAdapter):
                 self._connected = False
                 self._authenticated = False
                 self._subscriptions.clear()
+                self._init_v2_cache = None
+                self._init_v2_cache_at = 0.0
+
+    # ------------------------------------------------------------------
+    # Task periódica: refresh de ativos + auto-heal
+    # ------------------------------------------------------------------
+
+    def _start_refresh_task(self) -> None:
+        """Cria (se necessário) a task de refresh/auto-heal da sessão."""
+        if self._refresh_task and not self._refresh_task.done():
+            return
+        self._refresh_task = asyncio.create_task(self._assets_refresh_loop())
+
+    async def _stop_refresh_task(self) -> None:
+        """Cancela a task de refresh (usado no disconnect/shutdown)."""
+        task = self._refresh_task
+        self._refresh_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _assets_refresh_loop(self) -> None:
+        """
+        Loop periódico (intervalo via env IQ_REFRESH_SEC, padrão 300s):
+        - mantém o cache de ativos quente (fetch forçado a cada tick);
+        - verifica a saúde do WebSocket (check_connect) e reconecta com
+          backoff quando a sessão cai (auto-heal).
+        Desiste após MAX_HEAL_ATTEMPTS falhas seguidas — reconexão manual.
+        """
+        import time as _time
+
+        max_heal_attempts = 5
+        failures = 0
+        print(
+            f"[IQOption] refresh task iniciada (intervalo={self._refresh_interval_sec:.0f}s)",
+            flush=True,
+        )
+        try:
+            while True:
+                # Backoff progressivo em falhas; base no sucesso.
+                if failures == 0:
+                    wait = self._refresh_interval_sec
+                else:
+                    wait = min(60.0 * (2 ** min(failures - 1, 3)), 600.0)
+                await asyncio.sleep(wait)
+
+                if not self._email or not self._password:
+                    # Desconectado manualmente / sem credenciais — encerra.
+                    break
+
+                try:
+                    alive = False
+                    if self._api and self._connected:
+                        try:
+                            alive = bool(
+                                await asyncio.wait_for(
+                                    asyncio.to_thread(self._api.check_connect),
+                                    timeout=5.0,
+                                )
+                            )
+                        except Exception:
+                            alive = False
+
+                    if alive:
+                        failures = 0
+                        # Sessão OK: atualiza cache de ativos (max_age=0 força
+                        # fetch novo; o lock coalescing evita rajadas).
+                        await self._fetch_init_v2(timeout_sec=8.0, max_age_sec=0.0)
+                        print(
+                            f"[IQOption] refresh task: cache de ativos atualizado "
+                            f"({_time.strftime('%H:%M:%S')})",
+                            flush=True,
+                        )
+                    else:
+                        failures += 1
+                        if failures > max_heal_attempts:
+                            print(
+                                "[IQOption] auto-heal desistiu após 5 tentativas — "
+                                "reconecte manualmente",
+                                flush=True,
+                            )
+                            break
+                        print(
+                            f"[IQOption] auto-heal: sessão inativa, reconectando "
+                            f"(tentativa {failures}/{max_heal_attempts})",
+                            flush=True,
+                        )
+                        await self._heal_reconnect()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    failures += 1
+                    print(
+                        f"[IQOption] refresh task erro ({failures}): {e!r}",
+                        flush=True,
+                    )
+                    if failures > max_heal_attempts:
+                        print(
+                            "[IQOption] refresh task desistiu após erros seguidos",
+                            flush=True,
+                        )
+                        break
+        except asyncio.CancelledError:
+            print("[IQOption] refresh task cancelada", flush=True)
+            raise
+
+    async def _heal_reconnect(self) -> None:
+        """Derruba a sessão morta e reconecta com as credenciais em cache."""
+        if not self._email or not self._password:
+            return
+        if self._api:
+            try:
+                await asyncio.to_thread(self._api.disconnect)
+            except Exception:
+                pass
+            self._api = None
+            self._connected = False
+            self._authenticated = False
+        account_type = (
+            self._account_type.value
+            if hasattr(self._account_type, "value")
+            else str(self._account_type or "practice")
+        )
+        try:
+            await self.connect(
+                {
+                    "email": self._email,
+                    "password": self._password,
+                    "account_type": account_type,
+                }
+            )
+            print("[IQOption] auto-heal: reconectado com sucesso", flush=True)
+        except Exception as e:
+            print(f"[IQOption] auto-heal falhou: {e!r}", flush=True)
+            raise
 
     async def get_status(self) -> Dict[str, Any]:
         """
@@ -373,6 +547,45 @@ class IQOptionAdapter(BrokerAdapter):
                 original_error=e,
             )
 
+    async def _fetch_init_v2(
+        self, timeout_sec: float = 8.0, max_age_sec: float = 90.0, force: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Obtém turbo/binary actives com cache TTL.
+
+        get_all_init_v2 usa while-loop na lib — em sessões longas a resposta
+        "initialization-data" pode nunca chegar e o wait estoura. Cache
+        evita travar /assets e place_order (antes: 25s por ordem).
+        """
+        import time as _time
+
+        async with self._init_v2_lock:
+            now = _time.time()
+            if (
+                not force
+                and self._init_v2_cache is not None
+                and (now - self._init_v2_cache_at) < max_age_sec
+            ):
+                return self._init_v2_cache
+
+            if not self._api:
+                return self._init_v2_cache
+
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(self._api.get_all_init_v2, 0.2),
+                    timeout=timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                # Mantém cache anterior se houver (stale better than nothing)
+                return self._init_v2_cache
+
+            if isinstance(data, dict) and data:
+                self._init_v2_cache = data
+                self._init_v2_cache_at = now
+                return data
+            return self._init_v2_cache
+
     async def get_assets(self) -> List[Asset]:
         """
         Lista ativos disponíveis
@@ -383,32 +596,34 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
 
         try:
-            # Obter ativos abertos - assinatura correta: get_all_open_time() sem args
+            # get_all_open_time(polling) trava no bucket digital (bug da lib).
+            # get_all_init_v2 com cache evita bloqueio em sessão longa.
             assets = []
             seen: Dict[str, Asset] = {}
-            try:
-                all_assets = await asyncio.wait_for(
-                    asyncio.to_thread(self._api.get_all_open_time),
-                    timeout=25.0,
-                )
-            except asyncio.TimeoutError:
-                all_assets = None
+            all_assets = await self._fetch_init_v2(timeout_sec=8.0)
 
-            # Verificar se retornou dados validos
             if not isinstance(all_assets, dict):
                 return assets
 
-            # Agregar buckets de opções binárias (turbo/binary/digital).
-            # OTC geralmente está em "binary"; prioridade ao bucket com open=True.
-            for bucket in ("turbo", "binary", "digital"):
-                entries = all_assets.get(bucket)
+            # Agregar buckets turbo/binary/blitz (OTC e mercado regular).
+            # Blitz é o mercado de curto prazo atual (M1-M5); binary = Digital.
+            for bucket in ("turbo", "binary", "blitz"):
+                block = all_assets.get(bucket)
+                if not isinstance(block, dict):
+                    continue
+                entries = block.get("actives")
                 if not isinstance(entries, dict):
                     continue
-                for symbol, data in entries.items():
-                    if not isinstance(data, dict):
+                for _aid, active in entries.items():
+                    if not isinstance(active, dict):
                         continue
-                    is_open = bool(data.get("open", False))
-                    payout = float(data.get("payout", 0) or 0)
+                    raw_name = str(active.get("name", "") or "")
+                    symbol = raw_name.split(".")[-1] if raw_name else ""
+                    if not symbol:
+                        continue
+                    is_open = bool(active.get("enabled")) and not bool(
+                        active.get("is_suspended")
+                    )
                     existing = seen.get(symbol)
                     if existing is None:
                         seen[symbol] = Asset(
@@ -416,19 +631,18 @@ class IQOptionAdapter(BrokerAdapter):
                             name=symbol,
                             type=AssetType.BINARY,
                             status=AssetStatus.OPEN if is_open else AssetStatus.CLOSED,
-                            payout=payout,
+                            payout=0,
                             min_amount=1,
                             max_amount=1000,
                             expiration=[1, 5],
                         )
-                    elif is_open and not existing.status == AssetStatus.OPEN:
-                        # Bucket posterior confirma aberto — atualizar status/payout
+                    elif is_open:
                         seen[symbol] = Asset(
                             symbol=symbol,
                             name=symbol,
                             type=AssetType.BINARY,
                             status=AssetStatus.OPEN,
-                            payout=max(payout, existing.payout),
+                            payout=existing.payout,
                             min_amount=1,
                             max_amount=1000,
                             expiration=[1, 5],
@@ -597,11 +811,19 @@ class IQOptionAdapter(BrokerAdapter):
         self._ensure_connected()
 
         try:
-            # Verificar se ativo está aberto
-            asset_data = await self._get_asset_data(order.asset)
+            # Verificar se ativo está aberto (cache TTL — não bloqueia ordem).
+            # Com expiration: M1-M5 checam turbo/Blitz; >5min checam binary/Digital.
+            asset_data = await self._get_asset_data(order.asset, order.expiration)
             if asset_data and not asset_data.get("open", False):
+                if asset_data.get("is_suspended"):
+                    raise BrokerError(
+                        f"Ativo {order.asset} suspenso pela IQ Option "
+                        f"(horário/mercado). Escolha outro ativo.",
+                        code=ErrorCodes.MARKET_CLOSED,
+                        broker="iqoption",
+                    )
                 raise BrokerError(
-                    f"Asset {order.asset} is closed",
+                    f"Ativo {order.asset} fechado no momento",
                     code=ErrorCodes.MARKET_CLOSED,
                     broker="iqoption",
                 )
@@ -609,7 +831,7 @@ class IQOptionAdapter(BrokerAdapter):
                 # Ativo regular não encontrado no book em nenhum bucket:
                 # tratar como fechado para falhar rápido e claro.
                 raise BrokerError(
-                    f"Asset {order.asset} not found or market closed",
+                    f"Ativo {order.asset} não encontrado ou mercado fechado",
                     code=ErrorCodes.MARKET_CLOSED,
                     broker="iqoption",
                 )
@@ -903,44 +1125,69 @@ class IQOptionAdapter(BrokerAdapter):
             )
         return f"Connection error: {msg}"
 
-    async def _get_asset_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+    async def _get_asset_data(
+        self, symbol: str, expiration: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         """
-        Obtém dados de abertura do ativo em múltiplos buckets.
+        Obtém estado do ativo (enabled/is_suspended) nos buckets init_v2.
 
-        get_all_open_time() retorna: {"binary": {...}, "turbo": {...},
-        "digital": {...}, "cfd": {...}, "forex": {...}, ...} e pares OTC
-        frequentemente aparecem em "binary" (não só em "turbo").
-        Preferência: primeiro registro com open=True entre os buckets;
-        se o ativo existir apenas com open=False, retorna esse registro
-        (o chamador decide rejeitar).
+        Usa cache get_all_init_v2 (TTL 90s). Timeout curto para não atrasar
+        place_order (antes: 25s por ordem quando a lib não respondia).
 
-        Nota: a lib tem um bug em que chunk de dados digital não chega e
-        o loop interno trava — por isso a chamada roda com timeout e,
-        expirando, devolvemos None (o chamador decide o fallback).
+        Com expiration: ordens M1-M5 (buyv3 option_type_id=3) são do mercado
+        curto prazo (turbo/Blitz) — status vem de turbo+blitz; ordens >5min
+        (binary/Digital) vêm do bucket binary. Sem expiration: qualquer bucket.
+        Retorna {"open": bool, "is_suspended": bool, ...}.
         """
         try:
-            all_assets = await asyncio.wait_for(
-                asyncio.to_thread(self._api.get_all_open_time),
-                timeout=25.0,
-            )
+            all_assets = await self._fetch_init_v2(timeout_sec=6.0)
             if not isinstance(all_assets, dict):
                 return None
 
-            fallback: Optional[Dict[str, Any]] = None
-            for bucket in ("turbo", "binary", "digital"):
-                entries = all_assets.get(bucket)
-                if not isinstance(entries, dict) or symbol not in entries:
-                    continue
-                data = entries.get(symbol)
-                if not isinstance(data, dict):
-                    continue
-                if data.get("open", False):
-                    return data
-                if fallback is None:
-                    fallback = data
-            return fallback
-        except asyncio.TimeoutError:
-            return None
+            if expiration is None:
+                primary: tuple = ("turbo", "binary", "blitz")
+                secondary: tuple = ()
+            elif int(expiration) <= 5:
+                primary, secondary = ("turbo", "blitz"), ("binary",)
+            else:
+                primary, secondary = ("binary",), ("turbo", "blitz")
+
+            def _scan(buckets):
+                first_closed = None
+                for bucket in buckets:
+                    block = all_assets.get(bucket)
+                    if not isinstance(block, dict):
+                        continue
+                    entries = block.get("actives")
+                    if not isinstance(entries, dict):
+                        continue
+                    for _aid, active in entries.items():
+                        if not isinstance(active, dict):
+                            continue
+                        raw_name = str(active.get("name", "") or "")
+                        name = raw_name.split(".")[-1] if raw_name else ""
+                        if name != symbol:
+                            continue
+                        is_open = bool(active.get("enabled")) and not bool(
+                            active.get("is_suspended")
+                        )
+                        data = {
+                            "open": is_open,
+                            "enabled": bool(active.get("enabled")),
+                            "is_suspended": bool(active.get("is_suspended")),
+                            "name": raw_name,
+                            "bucket": bucket,
+                        }
+                        if is_open:
+                            return data
+                        if first_closed is None:
+                            first_closed = data
+                return first_closed
+
+            result = _scan(primary)
+            if result is None:
+                result = _scan(secondary)
+            return result
         except Exception:
             return None
 

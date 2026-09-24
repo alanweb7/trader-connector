@@ -387,24 +387,26 @@ class ConnectionRepository:
         result: Optional[str] = None,
         profit: Optional[float] = None,
         payout: Optional[float] = None,
+        broker_order_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Update order status/result
-        
+
         Args:
             order_id: Order UUID
             status: New status
             result: 'WIN', 'LOSS', or 'DRAW'
             profit: Profit amount
             payout: Payout percentage
-            
+            broker_order_id: Order ID returned by the broker
+
         Returns:
             Updated order record
         """
         db = get_supabase()
-        
+
         update_data: Dict[str, Any] = {}
-        
+
         if status is not None:
             update_data["status"] = status
         if result is not None:
@@ -413,20 +415,22 @@ class ConnectionRepository:
             update_data["profit"] = profit
         if payout is not None:
             update_data["payout"] = payout
-        
+        if broker_order_id is not None:
+            update_data["broker_order_id"] = broker_order_id
+
         if status == "closed":
             update_data["closed_at"] = datetime.utcnow().isoformat()
-        
+
         if not update_data:
             return None
-        
+
         result_query = (
             db.table("broker_orders")
             .update(update_data)
             .eq("id", order_id)
             .execute()
         )
-        
+
         return result_query.data[0] if result_query.data else None
 
 
