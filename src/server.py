@@ -945,8 +945,13 @@ async def get_candles(
     asset: str,
     timeframe: int = 1,
     count: int = 100,
+    end_time: Optional[int] = None,
 ):
-    """Obtém candles históricos"""
+    """Obtém candles históricos
+
+    end_time (opcional): timestamp final em epoch segundos — usado pelo
+    backtest para paginação (candles mais antigos que a página anterior).
+    """
     connection = broker_registry.get_connection(connection_id)
     if not connection:
         raise HTTPException(status_code=404, detail="Connection not found")
@@ -956,7 +961,10 @@ async def get_candles(
         raise HTTPException(status_code=400, detail="Not connected")
     
     try:
-        candles = await adapter.get_candles(asset, timeframe, count)
+        if end_time is not None:
+            candles = await adapter.get_candles(asset, timeframe, count, end_time=end_time)
+        else:
+            candles = await adapter.get_candles(asset, timeframe, count)
         return {"candles": [c.model_dump() for c in candles]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

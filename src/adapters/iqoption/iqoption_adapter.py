@@ -473,11 +473,17 @@ class IQOptionAdapter(BrokerAdapter):
                 pass
 
             if profile_msg:
+                # profile.msg = {isSuccessful, message, result: {id, currency, ...}}
+                result = profile_msg.get("result")
+                if not isinstance(result, dict):
+                    result = {}
+                acc_id = result.get("id") or profile_msg.get("id") or ""
+                currency = result.get("currency") or profile_msg.get("currency") or "USD"
                 return Account(
-                    id=str(profile_msg.get("id", "")),
+                    id=str(acc_id),
                     broker="iqoption",
                     type=self._account_type,
-                    currency=profile_msg.get("currency", "USD"),
+                    currency=currency,
                     status=ConnectionStatus.READY,
                 )
 
@@ -702,7 +708,7 @@ class IQOptionAdapter(BrokerAdapter):
             )
 
     async def get_candles(
-        self, asset: str, timeframe: int, count: int
+        self, asset: str, timeframe: int, count: int, end_time: Optional[int] = None
     ) -> List[Candle]:
         """
         Obtém candles históricos
@@ -711,6 +717,9 @@ class IQOptionAdapter(BrokerAdapter):
             asset: Ativo
             timeframe: Timeframe em minutos
             count: Quantidade de candles
+            end_time: Timestamp final (epoch segundos). Se None, usa o relógio
+                do servidor IQ — com fallback para o relógio local quando o
+                timeSync ainda não sincronizou (server_timestamp None).
 
         Returns:
             Lista de candles
@@ -722,7 +731,18 @@ class IQOptionAdapter(BrokerAdapter):
             interval = timeframe * 60
 
             # Obter timestamp final
-            end_time = await asyncio.to_thread(self._api.get_server_timestamp)
+            if end_time is None:
+                import time as _time
+
+                try:
+                    end_time = await asyncio.to_thread(self._api.get_server_timestamp)
+                except Exception:
+                    # timesync.server_timestamp None → None / 1000 (TypeError);
+                    # timeSync ainda não recebido → AttributeError
+                    end_time = None
+                # None ou timestamp implausível (antes de 2001) → relógio local
+                if not isinstance(end_time, (int, float)) or end_time < 1_000_000_000:
+                    end_time = int(_time.time())
 
             # Obter candles
             candles_data = await asyncio.to_thread(
