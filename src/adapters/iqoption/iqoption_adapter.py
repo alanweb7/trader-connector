@@ -54,6 +54,10 @@ class IQOptionAdapter(BrokerAdapter):
         self._instruments_cache: Dict[str, Dict[str, Any]] = {}
         self._instruments_cache_at: float = 0.0
         self._instruments_lock: asyncio.Lock = asyncio.Lock()
+        # IQ rejeita get-instruments (result=False) — cache negativo evita ~30s
+        # de tentativas a cada /assets; volta a tentar após o TTL
+        self._instruments_dead: bool = False
+        self._instruments_dead_until: float = 0.0
         # Task periódica: mantém cache de ativos quente e detecta queda de
         # sessão (auto-heal com backoff).
         self._refresh_task: Optional[asyncio.Task] = None
@@ -597,20 +601,103 @@ class IQOptionAdapter(BrokerAdapter):
                 return data
             return self._init_v2_cache
 
+    def _get_instruments_once(
+        self, itype: str, timeout: float = 10.0
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Uma tentativa de get-instruments SEM o while-loop perigoso da
+        stable_api (spin + connect() em falha). Usa send_websocket_request
+        direto, com request_id próprio, várias variantes de payload e
+        janela limitada por variante. Retorna o dict ou None.
+        """
+        import time as _t
+
+        base = getattr(self._api, "api", None)
+        if base is None:
+            return None
+        # IQOptionAPI (api.py) expõe send_websocket_request/instruments/
+        # result; o wrapper stable_api.IQ_Option não expõe.
+        api = base
+        variants = [
+            ("v4+rid", {"type": itype, "is_regulated": 1}, "4.0", True),
+            ("v5+rid", {"type": itype, "is_regulated": 1}, "5.0", True),
+            (
+                "v4+reg",
+                {"type": itype, "is_regulated": 1, "is_buyback": 1},
+                "4.0",
+                True,
+            ),
+            ("v4-rid", {"type": itype}, "4.0", False),
+        ]
+        per_variant = max(2.0, timeout / max(1, len(variants)))
+        saw_reject = False
+
+        for label, body, version, use_rid in variants:
+            t0 = _t.time()
+            rid = f"ins-{itype}-{_t.time_ns()}" if use_rid else ""
+            try:
+                api.instruments = None
+                api.send_websocket_request(
+                    "sendMessage",
+                    {
+                        "name": "get-instruments",
+                        "version": version,
+                        "body": body,
+                    },
+                    request_id=rid,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[IQOption] instruments/{itype} [{label}] erro: {exc!r}",
+                    flush=True,
+                )
+                continue
+            while api.instruments is None and _t.time() - t0 < per_variant:
+                # resposta definitiva chegou (True/False) → não espera mais
+                if use_rid and api.result.get(rid) is not None:
+                    break
+                _t.sleep(0.05)
+            elapsed = _t.time() - t0
+            result = api.result.get(rid) if use_rid else None
+            if result is False:
+                saw_reject = True
+            data = api.instruments
+            if isinstance(data, dict) and data:
+                print(
+                    f"[IQOption] instruments/{itype} [{label}] ok em "
+                    f"{elapsed:.1f}s",
+                    flush=True,
+                )
+                return data
+            print(
+                f"[IQOption] instruments/{itype} [{label}] sem payload em "
+                f"{elapsed:.1f}s result={result}",
+                flush=True,
+            )
+        if saw_reject:
+            # IQ recusou get-instruments (conta sem esse recurso / API mudou)
+            self._instruments_dead = True
+        return None
+
     async def _fetch_instruments(
         self, timeout_sec: float = 10.0, max_age_sec: float = 90.0
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Catálogo dinâmico crypto/forex/cfd com cache TTL.
+        Catálogo dinâmico crypto/forex/cfd com cache TTL + cache negativo.
 
-        get_instruments(type) tem while-loop interno de até 10s por tipo
-        (e reconecta em falha) — roda em thread com timeout por tipo e
-        degrada para o cache anterior. Nunca derruba /assets.
+        IQ recusou get-instruments nesta conta (result=False); o cache
+        negativo (_instruments_dead) pula a tentativa por 6h. Nunca
+        derruba /assets.
         """
         import time as _time
 
         async with self._instruments_lock:
             now = _time.time()
+            if now < self._instruments_dead_until:
+                return self._instruments_cache
+            if self._instruments_dead:
+                # TTL do cache negativo expirou — volta a tentar
+                self._instruments_dead = False
             if self._instruments_cache and (
                 now - self._instruments_cache_at
             ) < max_age_sec:
@@ -622,13 +709,14 @@ class IQOptionAdapter(BrokerAdapter):
             merged: Dict[str, Dict[str, Any]] = dict(self._instruments_cache)
             fetched = False
             for itype in ("crypto", "forex", "cfd"):
+                if self._instruments_dead:
+                    break
                 try:
-                    data = await asyncio.wait_for(
-                        asyncio.to_thread(self._api.get_instruments, itype, 0),
-                        timeout=timeout_sec,
+                    data = await asyncio.to_thread(
+                        self._get_instruments_once, itype, timeout_sec
                     )
                 except Exception:
-                    # timeout/reconexão da lib — mantém o que já temos
+                    # falha inesperada — mantém o que já temos
                     continue
                 if not isinstance(data, dict):
                     continue
@@ -648,6 +736,13 @@ class IQOptionAdapter(BrokerAdapter):
             if fetched:
                 self._instruments_cache = merged
                 self._instruments_cache_at = now
+            if self._instruments_dead:
+                self._instruments_dead_until = now + 21600.0
+                print(
+                    "[IQOption] get-instruments recusado pela IQ — "
+                    "catálogo CFD indisponível, nova tentativa em 6h",
+                    flush=True,
+                )
             return self._instruments_cache
 
     async def get_assets(self) -> List[Asset]:
@@ -665,6 +760,20 @@ class IQOptionAdapter(BrokerAdapter):
             assets = []
             seen: Dict[str, Asset] = {}
             all_assets = await self._fetch_init_v2(timeout_sec=8.0)
+            if not getattr(self, "_v2_keys_logged", False) and isinstance(
+                all_assets, dict
+            ):
+                _summary = {
+                    k: (
+                        len(v.get("actives", {}))
+                        if isinstance(v, dict)
+                        and isinstance(v.get("actives"), dict)
+                        else type(v).__name__
+                    )
+                    for k, v in all_assets.items()
+                }
+                print(f"[IQOption] init_v2 buckets: {_summary}", flush=True)
+                self._v2_keys_logged = True
 
             # Agregar buckets turbo/binary/blitz (OTC e mercado regular).
             # Blitz é o mercado de curto prazo atual (M1-M5); binary = Digital.
