@@ -58,6 +58,8 @@ class IQOptionAdapter(BrokerAdapter):
         # de tentativas a cada /assets; volta a tentar após o TTL
         self._instruments_dead: bool = False
         self._instruments_dead_until: float = 0.0
+        # Serializa chamadas à lib (api.candles.candles_data é global)
+        self._candles_lock: asyncio.Lock = asyncio.Lock()
         # Task periódica: mantém cache de ativos quente e detecta queda de
         # sessão (auto-heal com backoff).
         self._refresh_task: Optional[asyncio.Task] = None
@@ -940,6 +942,69 @@ class IQOptionAdapter(BrokerAdapter):
                 original_error=e,
             )
 
+    def _get_candles_once(
+        self, active_id: int, interval: int, count: int, end_time: int
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        get-candles SEM o while-loop da stable_api (busy-wait infinito +
+        connect() em falha — cada connect() conta para o rate limit de
+        login da IQ e bloqueia o IP por 60min). Envia o pedido direto no
+        WebSocket e espera com polling + timeout de 20s.
+        """
+        import time as _t
+
+        if not self._api:
+            return None
+        api_raw = self._api.api
+        try:
+            api_raw.candles.candles_data = None
+            api_raw.getcandles(
+                int(active_id), int(interval), int(count), int(end_time)
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[IQOption] get-candles envio falhou: {exc!r}", flush=True)
+            return None
+        deadline = _t.time() + 20.0
+        while _t.time() < deadline:
+            data = api_raw.candles.candles_data
+            if data is not None:
+                return data
+            _t.sleep(0.05)
+        return None
+
+    def _sync_actives_from_v2(self) -> None:
+        """
+        Popula iqoptionapi.constants.ACTIVES a partir do cache do init_v2
+        (buckets turbo/binary/blitz). A lib só preenche ACTIVES via
+        get_instruments/get_all_init (indisponíveis neste fluxo); sem o
+        mapeamento, stable_api.get_candles/buy lancam KeyError e o while
+        da lib chama connect() em loop infinito (busy-wait, sem resposta).
+        """
+        data = self._init_v2_cache
+        if not isinstance(data, dict):
+            return
+        import iqoptionapi.constants as _OP
+
+        for bucket in ("turbo", "binary", "blitz"):
+            block = data.get(bucket)
+            if not isinstance(block, dict):
+                continue
+            entries = block.get("actives")
+            if not isinstance(entries, dict):
+                continue
+            for _aid, active in entries.items():
+                if not isinstance(active, dict):
+                    continue
+                raw_name = str(active.get("name", "") or "")
+                symbol = raw_name.split(".")[-1] if raw_name else ""
+                if not symbol:
+                    continue
+                try:
+                    active_id = int(_aid)
+                except (TypeError, ValueError):
+                    continue
+                _OP.ACTIVES.setdefault(symbol, active_id)
+
     async def get_candles(
         self, asset: str, timeframe: int, count: int, end_time: Optional[int] = None
     ) -> List[Candle]:
@@ -963,6 +1028,20 @@ class IQOptionAdapter(BrokerAdapter):
             # Converter timeframe para segundos
             interval = timeframe * 60
 
+            # Garante mapeamento symbol -> active_id (senão a lib cai
+            # em KeyError + connect() em loop e nunca responde)
+            if not self._init_v2_cache:
+                await self._fetch_init_v2(timeout_sec=8.0)
+            self._sync_actives_from_v2()
+            import iqoptionapi.constants as _OP
+            if asset not in _OP.ACTIVES:
+                raise BrokerError(
+                    f"Ativo {asset} indisponível nesta conta "
+                    "(ausente do catálogo IQ)",
+                    code=ErrorCodes.ASSET_NOT_FOUND,
+                    broker="iqoption",
+                )
+
             # Obter timestamp final
             if end_time is None:
                 import time as _time
@@ -977,10 +1056,24 @@ class IQOptionAdapter(BrokerAdapter):
                 if not isinstance(end_time, (int, float)) or end_time < 1_000_000_000:
                     end_time = int(_time.time())
 
-            # Obter candles
-            candles_data = await asyncio.to_thread(
-                self._api.get_candles, asset, interval, count, end_time
-            )
+            # Obter candles: polling próprio com timeout (sem o busy-wait
+            # infinito nem connect() em loop da stable_api)
+            async with self._candles_lock:
+                active_id = _OP.ACTIVES[asset]
+                candles_data = await asyncio.to_thread(
+                    self._get_candles_once,
+                    active_id,
+                    interval,
+                    count,
+                    end_time,
+                )
+            if candles_data is None:
+                raise BrokerError(
+                    f"Timeout: IQ Option não respondeu candles de "
+                    f"{asset} em 20s",
+                    code=ErrorCodes.UNKNOWN_ERROR,
+                    broker="iqoption",
+                )
 
             candles = []
             if candles_data:
@@ -1000,6 +1093,8 @@ class IQOptionAdapter(BrokerAdapter):
 
             return candles
 
+        except BrokerError:
+            raise
         except Exception as e:
             raise BrokerError(
                 f"Failed to get candles: {str(e)}",
@@ -1154,6 +1249,7 @@ class IQOptionAdapter(BrokerAdapter):
         """
         import random
 
+        self._sync_actives_from_v2()
         req_id = str(random.randint(100000, 999999))
         api_raw = self._api.api
 
