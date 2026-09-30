@@ -49,6 +49,11 @@ class IQOptionAdapter(BrokerAdapter):
         self._init_v2_cache: Optional[Dict[str, Any]] = None
         self._init_v2_cache_at: float = 0.0
         self._init_v2_lock: asyncio.Lock = asyncio.Lock()
+        # Cache de get_instruments (crypto/forex/cfd) — mesmo padrão do init_v2:
+        # while-loop da lib pode demorar até 10s por tipo em sessão longa.
+        self._instruments_cache: Dict[str, Dict[str, Any]] = {}
+        self._instruments_cache_at: float = 0.0
+        self._instruments_lock: asyncio.Lock = asyncio.Lock()
         # Task periódica: mantém cache de ativos quente e detecta queda de
         # sessão (auto-heal com backoff).
         self._refresh_task: Optional[asyncio.Task] = None
@@ -592,6 +597,59 @@ class IQOptionAdapter(BrokerAdapter):
                 return data
             return self._init_v2_cache
 
+    async def _fetch_instruments(
+        self, timeout_sec: float = 10.0, max_age_sec: float = 90.0
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Catálogo dinâmico crypto/forex/cfd com cache TTL.
+
+        get_instruments(type) tem while-loop interno de até 10s por tipo
+        (e reconecta em falha) — roda em thread com timeout por tipo e
+        degrada para o cache anterior. Nunca derruba /assets.
+        """
+        import time as _time
+
+        async with self._instruments_lock:
+            now = _time.time()
+            if self._instruments_cache and (
+                now - self._instruments_cache_at
+            ) < max_age_sec:
+                return self._instruments_cache
+
+            if not self._api:
+                return self._instruments_cache
+
+            merged: Dict[str, Dict[str, Any]] = dict(self._instruments_cache)
+            fetched = False
+            for itype in ("crypto", "forex", "cfd"):
+                try:
+                    data = await asyncio.wait_for(
+                        asyncio.to_thread(self._api.get_instruments, itype, 0),
+                        timeout=timeout_sec,
+                    )
+                except Exception:
+                    # timeout/reconexão da lib — mantém o que já temos
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                entries = data.get("instruments")
+                if not isinstance(entries, list):
+                    continue
+                for ins in entries:
+                    if not isinstance(ins, dict):
+                        continue
+                    # 'id' é o nome do ativo; 'active_id' o id numérico da IQ
+                    name = str(ins.get("id") or ins.get("name") or "").strip()
+                    if not name:
+                        continue
+                    merged[name] = {"type": itype, "ins": ins}
+                    fetched = True
+
+            if fetched:
+                self._instruments_cache = merged
+                self._instruments_cache_at = now
+            return self._instruments_cache
+
     async def get_assets(self) -> List[Asset]:
         """
         Lista ativos disponíveis
@@ -608,51 +666,90 @@ class IQOptionAdapter(BrokerAdapter):
             seen: Dict[str, Asset] = {}
             all_assets = await self._fetch_init_v2(timeout_sec=8.0)
 
-            if not isinstance(all_assets, dict):
-                return assets
-
             # Agregar buckets turbo/binary/blitz (OTC e mercado regular).
             # Blitz é o mercado de curto prazo atual (M1-M5); binary = Digital.
-            for bucket in ("turbo", "binary", "blitz"):
-                block = all_assets.get(bucket)
-                if not isinstance(block, dict):
-                    continue
-                entries = block.get("actives")
-                if not isinstance(entries, dict):
-                    continue
-                for _aid, active in entries.items():
-                    if not isinstance(active, dict):
+            bucket_types = {
+                "turbo": AssetType.TURBO,
+                "binary": AssetType.BINARY,
+                "blitz": AssetType.BLITZ,
+            }
+            if isinstance(all_assets, dict):
+                for bucket, bucket_type in bucket_types.items():
+                    block = all_assets.get(bucket)
+                    if not isinstance(block, dict):
                         continue
-                    raw_name = str(active.get("name", "") or "")
-                    symbol = raw_name.split(".")[-1] if raw_name else ""
-                    if not symbol:
+                    entries = block.get("actives")
+                    if not isinstance(entries, dict):
                         continue
-                    is_open = bool(active.get("enabled")) and not bool(
-                        active.get("is_suspended")
-                    )
-                    existing = seen.get(symbol)
-                    if existing is None:
-                        seen[symbol] = Asset(
-                            symbol=symbol,
-                            name=symbol,
-                            type=AssetType.BINARY,
-                            status=AssetStatus.OPEN if is_open else AssetStatus.CLOSED,
-                            payout=0,
-                            min_amount=1,
-                            max_amount=1000,
-                            expiration=[1, 5],
+                    for _aid, active in entries.items():
+                        if not isinstance(active, dict):
+                            continue
+                        raw_name = str(active.get("name", "") or "")
+                        symbol = raw_name.split(".")[-1] if raw_name else ""
+                        if not symbol:
+                            continue
+                        is_open = bool(active.get("enabled")) and not bool(
+                            active.get("is_suspended")
                         )
-                    elif is_open:
-                        seen[symbol] = Asset(
-                            symbol=symbol,
-                            name=symbol,
-                            type=AssetType.BINARY,
-                            status=AssetStatus.OPEN,
-                            payout=existing.payout,
-                            min_amount=1,
-                            max_amount=1000,
-                            expiration=[1, 5],
-                        )
+                        try:
+                            active_id = int(_aid)
+                        except (TypeError, ValueError):
+                            active_id = None
+                        existing = seen.get(symbol)
+                        if existing is None:
+                            seen[symbol] = Asset(
+                                symbol=symbol,
+                                name=symbol,
+                                type=bucket_type,
+                                status=AssetStatus.OPEN
+                                if is_open
+                                else AssetStatus.CLOSED,
+                                active_id=active_id,
+                                payout=0,
+                                min_amount=1,
+                                max_amount=1000,
+                                expiration=[1, 5],
+                            )
+                        elif is_open:
+                            seen[symbol] = Asset(
+                                symbol=symbol,
+                                name=symbol,
+                                type=existing.type,
+                                status=AssetStatus.OPEN,
+                                active_id=existing.active_id
+                                if existing.active_id is not None
+                                else active_id,
+                                payout=existing.payout,
+                                min_amount=1,
+                                max_amount=1000,
+                                expiration=[1, 5],
+                            )
+
+            # Catálogo dinâmico crypto/forex/cfd — sem open-time por ativo,
+            # status fica 'unknown' (UI mostra n/d).
+            for name, meta in (await self._fetch_instruments()).items():
+                if not name or name in seen:
+                    continue
+                raw = meta.get("ins") if isinstance(meta, dict) else None
+                active_id = None
+                if isinstance(raw, dict):
+                    try:
+                        active_id = int(raw.get("active_id"))
+                    except (TypeError, ValueError):
+                        active_id = None
+                itype = str(meta.get("type", "") or "") if isinstance(meta, dict) else ""
+                asset_type = getattr(AssetType, itype.upper(), None) if itype else None
+                seen[name] = Asset(
+                    symbol=name,
+                    name=name,
+                    type=asset_type if asset_type is not None else AssetType.BINARY,
+                    status=AssetStatus.UNKNOWN,
+                    active_id=active_id,
+                    payout=0,
+                    min_amount=1,
+                    max_amount=1000,
+                    expiration=[1, 5],
+                )
 
             assets = list(seen.values())
             return assets
@@ -686,6 +783,33 @@ class IQOptionAdapter(BrokerAdapter):
                     type=AssetType.BINARY,
                     status=AssetStatus.OPEN if data.get("open", False) else AssetStatus.CLOSED,
                     payout=data.get("payout", 0),
+                    min_amount=1,
+                    max_amount=1000,
+                    expiration=[1, 5],
+                )
+
+            # Fallback: catálogo dinâmico (crypto/forex/cfd) — sem open-time
+            # por símbolo, status desconhecido (UI exibe n/d).
+            meta = (await self._fetch_instruments()).get(symbol)
+            if isinstance(meta, dict):
+                raw = meta.get("ins")
+                active_id = None
+                if isinstance(raw, dict):
+                    try:
+                        active_id = int(raw.get("active_id"))
+                    except (TypeError, ValueError):
+                        active_id = None
+                itype = str(meta.get("type", "") or "")
+                asset_type = (
+                    getattr(AssetType, itype.upper(), None) if itype else None
+                )
+                return Asset(
+                    symbol=symbol,
+                    name=symbol,
+                    type=asset_type if asset_type is not None else AssetType.BINARY,
+                    status=AssetStatus.UNKNOWN,
+                    active_id=active_id,
+                    payout=0,
                     min_amount=1,
                     max_amount=1000,
                     expiration=[1, 5],

@@ -59,12 +59,15 @@ class AssetType(str, Enum):
     FOREX = "forex"
     CRYPTO = "crypto"
     CFD = "cfd"
+    TURBO = "turbo"
+    BLITZ = "blitz"
 
 
 class AssetStatus(str, Enum):
     """Status do ativo"""
     OPEN = "open"
     CLOSED = "closed"
+    UNKNOWN = "unknown"
 
 
 class Account(BaseModel):
@@ -96,6 +99,7 @@ class Asset(BaseModel):
     name: Optional[str] = None
     type: AssetType = AssetType.BINARY
     status: AssetStatus = AssetStatus.CLOSED
+    active_id: Optional[int] = None
     payout: float = 0.0
     min_amount: float = 0.0
     max_amount: float = 0.0
