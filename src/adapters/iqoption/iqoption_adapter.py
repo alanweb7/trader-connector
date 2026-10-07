@@ -60,6 +60,12 @@ class IQOptionAdapter(BrokerAdapter):
         self._instruments_dead_until: float = 0.0
         # Serializa chamadas à lib (api.candles.candles_data é global)
         self._candles_lock: asyncio.Lock = asyncio.Lock()
+        # Streaming de candles em tempo real (canal candle-generated).
+        # Várias inscrições do mesmo par (asset, intervalo) compartilham
+        # UMA assinatura na IQ (refcount por chave "asset:intervalo_seg").
+        self._stream_lock: asyncio.Lock = asyncio.Lock()
+        self._streams: Dict[str, Dict[str, Any]] = {}
+        self._stream_poll_task: Optional[asyncio.Task] = None
         # Task periódica: mantém cache de ativos quente e detecta queda de
         # sessão (auto-heal com backoff).
         self._refresh_task: Optional[asyncio.Task] = None
@@ -300,6 +306,7 @@ class IQOptionAdapter(BrokerAdapter):
     async def disconnect(self) -> None:
         """Desconecta do IQ Option"""
         await self._stop_refresh_task()
+        await self._stop_stream_poll_task()
         if self._api:
             try:
                 await asyncio.to_thread(self._api.disconnect)
@@ -310,6 +317,7 @@ class IQOptionAdapter(BrokerAdapter):
                 self._connected = False
                 self._authenticated = False
                 self._subscriptions.clear()
+                self._streams.clear()
                 self._init_v2_cache = None
                 self._init_v2_cache_at = 0.0
 
@@ -1103,48 +1111,358 @@ class IQOptionAdapter(BrokerAdapter):
                 original_error=e,
             )
 
+    # ------------------------------------------------------------------
+    # Streaming de candles em tempo real (canal candle-generated)
+    # ------------------------------------------------------------------
+
+    # Velas mantidas por par no dict realtime da lib (dict_queue_add)
+    _STREAM_MAXDICT = 300
+    # Espera pela 1ª vela confirmada (mesmo prazo da stable_api)
+    _STREAM_CONFIRM_SEC = 15.0
+
+    def _stream_key(self, asset: str, interval: int) -> str:
+        return f"{asset}:{interval}"
+
+    def _start_stream_sync(self, active: str, size: int) -> bool:
+        """
+        Envia subscribeMessage (candle-generated) e aguarda a 1ª vela.
+
+        Executa em thread via to_thread (o loop da lib é bloqueante).
+        Diferente da stable_api.start_candles_stream, NÃO usa o
+        get_candles da lib (busy-wait infinito com connect() em falha —
+        cada connect() conta para o rate limit de login da IQ) nem
+        faz seed de histórico: o dict realtime enche com os próximos
+        ticks.
+
+        Returns:
+            True se a lib confirmou (candle_generated_check),
+            False se enviado mas sem confirmação no prazo (o caller
+            pode cair para fallback REST).
+        """
+        import time as _t
+
+        import iqoptionapi.constants as _OP
+
+        api_raw = self._api.api
+        # maxdict ANTES do subscribe: dict_queue_add faz int < maxdict e o
+        # defaultdict devolveria dict (TypeError em toda mensagem recebida).
+        api_raw.real_time_candles_maxdict_table[str(active)][int(size)] = (
+            self._STREAM_MAXDICT
+        )
+        # Registro para o re_subscribe_stream() do connect() da lib
+        # (formatação idêntica à da stable_api: "ACTIVE,tamanho").
+        list_key = f"{active},{size}"
+        if list_key not in self._api.subscribe_candle:
+            self._api.subscribe_candle.append(list_key)
+
+        deadline = _t.time() + self._STREAM_CONFIRM_SEC
+        while _t.time() < deadline:
+            try:
+                if api_raw.candle_generated_check[str(active)][int(size)] is True:
+                    return True
+            except Exception:
+                pass
+            try:
+                api_raw.subscribe(_OP.ACTIVES[active], size)
+            except Exception as exc:
+                raise BrokerError(
+                    f"Falha ao assinar stream de candles de {active}: {exc}",
+                    code=ErrorCodes.WEBSOCKET_ERROR,
+                    broker="iqoption",
+                    original_error=exc,
+                )
+            _t.sleep(1.0)
+        return False
+
+    def _stop_stream_sync(self, active: str, size: int) -> None:
+        """Encerra a assinatura candle-generated (sem loops da stable_api)."""
+        import iqoptionapi.constants as _OP
+
+        api_raw = self._api.api
+        list_key = f"{active},{size}"
+        try:
+            if list_key in self._api.subscribe_candle:
+                self._api.subscribe_candle.remove(list_key)
+        except Exception:
+            pass
+        try:
+            api_raw.candle_generated_check[str(active)][int(size)] = {}
+        except Exception:
+            pass
+        try:
+            api_raw.unsubscribe(_OP.ACTIVES[active], size)
+        except Exception:
+            pass
+
+    def _read_realtime_msg_sync(
+        self, active: str, size: int
+    ) -> Optional[Dict[str, Any]]:
+        """Lê a vela mais recente do dict realtime da lib (leitura de dict)."""
+        try:
+            table = self._api.api.real_time_candles[str(active)][int(size)]
+            if not table:
+                return None
+            latest = table[max(table.keys())]
+            return latest if isinstance(latest, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _msg_to_candle(
+        asset: str, timeframe: int, msg: Dict[str, Any]
+    ) -> Optional[Candle]:
+        """
+        Converte o payload candle-generated em Candle. Os campos variam
+        entre canais (ex.: candles-generated usa "value" no lugar de
+        "close" e "max"/"min" como no histórico) — cada um tem fallback.
+        """
+        try:
+            close = msg.get("close")
+            if close is None:
+                close = msg.get("value")
+            if close is None:
+                return None
+            high = msg.get("max")
+            if high is None:
+                high = msg.get("high")
+            low = msg.get("min")
+            if low is None:
+                low = msg.get("low")
+            raw_volume = msg.get("volume")
+            return Candle(
+                asset=asset,
+                timeframe=f"M{timeframe}",
+                timestamp=int(msg.get("from", 0) or 0),
+                open=float(msg.get("open", 0) or 0),
+                high=float(high or 0),
+                low=float(low or 0),
+                close=float(close),
+                volume=float(raw_volume) if raw_volume is not None else None,
+            )
+        except Exception:
+            return None
+
+    def _ensure_stream_poll_task(self) -> None:
+        """Cria (se necessário) a task que lê velas realtime e dispara callbacks."""
+        if self._stream_poll_task and not self._stream_poll_task.done():
+            return
+        self._stream_poll_task = asyncio.create_task(self._stream_poll_loop())
+
+    async def _stop_stream_poll_task(self) -> None:
+        """Cancela a task de polling de velas realtime (disconnect/shutdown)."""
+        task = self._stream_poll_task
+        self._stream_poll_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _stream_poll_loop(self) -> None:
+        """
+        A cada 0.4s lê o dict realtime da lib e dispara os callbacks das
+        inscrições ativas quando a vela muda (timestamp, close, high, low).
+        A push chega pela thread do websocket-client da lib; aqui só
+        fazemos leitura de dict — nada bloqueia o event loop. Encerra sozinha
+        quando não há inscrições de stream ativas.
+        """
+        try:
+            while True:
+                await asyncio.sleep(0.4)
+                subs = [
+                    s
+                    for s in self._subscriptions.values()
+                    if s.get("active") and s.get("stream")
+                ]
+                if not subs:
+                    break
+                for sub in subs:
+                    try:
+                        asset = sub["asset"]
+                        timeframe = int(sub["timeframe"])
+                        msg = self._read_realtime_msg_sync(
+                            asset, timeframe * 60
+                        )
+                        if not msg:
+                            continue
+                        candle = self._msg_to_candle(asset, timeframe, msg)
+                        if candle is None or candle.timestamp <= 0:
+                            continue
+                        fingerprint = (
+                            candle.timestamp,
+                            candle.close,
+                            candle.high,
+                            candle.low,
+                        )
+                        if sub.get("last") == fingerprint:
+                            continue
+                        sub["last"] = fingerprint
+                        callback = sub.get("callback")
+                        if callback:
+                            result = callback(candle)
+                            if asyncio.iscoroutine(result):
+                                await result
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[IQOption] stream callback falhou: {exc!r}", flush=True)
+        except asyncio.CancelledError:
+            pass
+
     async def subscribe_candles(
         self, asset: str, timeframe: int, callback: Callable
     ) -> str:
         """
-        Inscreve-se para receber candles em tempo real
+        Inscreve-se para receber candles em tempo real (candle-generated).
 
         Args:
-            asset: Ativo
-            timeframe: Timeframe em minutos
-            callback: Função de retorno
+            asset: Ativo (ex.: EURUSD-OTC)
+            timeframe: Timeframe em minutos (1, 5, 15, 30…)
+            callback: Chamado com um Candle a cada atualização. Pode ser
+                síncrono ou async (o retorno awaitable é aguardado).
 
         Returns:
-            ID da inscrição
+            ID da inscrição (para unsubscribe_candles)
         """
         self._ensure_connected()
 
-        subscription_id = str(uuid4())
+        try:
+            interval = int(timeframe) * 60
+            # Tamanhos aceitos pelo canal (stable_api.size, em segundos)
+            if interval not in getattr(self._api, "size", []):
+                raise BrokerError(
+                    f"Timeframe {timeframe}min não suportado pelo stream da "
+                    f"IQ Option (intervalos válidos em segundos: "
+                    f"{getattr(self._api, 'size', [])})",
+                    code=ErrorCodes.NOT_SUPPORTED,
+                    broker="iqoption",
+                )
+            # Garante mapeamento symbol -> active_id (senão KeyError no canal)
+            if not self._init_v2_cache:
+                await self._fetch_init_v2(timeout_sec=8.0)
+            self._sync_actives_from_v2()
+            import iqoptionapi.constants as _OP
 
-        # Armazenar inscrição
-        self._subscriptions[subscription_id] = {
-            "asset": asset,
-            "timeframe": timeframe,
-            "callback": callback,
-            "active": True,
-        }
+            if asset not in _OP.ACTIVES:
+                raise BrokerError(
+                    f"Ativo {asset} indisponível nesta conta "
+                    "(ausente do catálogo IQ)",
+                    code=ErrorCodes.ASSET_NOT_FOUND,
+                    broker="iqoption",
+                )
 
-        # TODO: Implementar streaming real de candles
-        # A biblioteca iqoptionapi pode não suportar streaming assíncrono diretamente
-        # Necessário verificar documentação ou implementar polling
+            subscription_id = str(uuid4())
+            key = self._stream_key(asset, interval)
+            async with self._stream_lock:
+                entry = self._streams.get(key)
+                if not entry or not entry.get("started"):
+                    confirmed = await asyncio.wait_for(
+                        asyncio.to_thread(self._start_stream_sync, asset, interval),
+                        timeout=self._STREAM_CONFIRM_SEC + 25.0,
+                    )
+                    entry = self._streams.setdefault(
+                        key, {"refs": 0, "started": False, "confirmed": False}
+                    )
+                    entry["started"] = True
+                    entry["confirmed"] = bool(confirmed)
+                    if not confirmed:
+                        print(
+                            f"[IQOption] stream {asset} M{timeframe}: assinatura "
+                            "enviada sem confirmação da 1ª vela (mercado "
+                            "parado?) — dados podem atrasar até o próximo tick",
+                            flush=True,
+                        )
+                entry["refs"] = int(entry.get("refs", 0)) + 1
+                self._subscriptions[subscription_id] = {
+                    "asset": asset,
+                    "timeframe": timeframe,
+                    "callback": callback,
+                    "active": True,
+                    "stream": True,
+                    "last": None,
+                }
+                self._ensure_stream_poll_task()
+            return subscription_id
 
-        return subscription_id
+        except BrokerError:
+            raise
+        except asyncio.TimeoutError:
+            raise BrokerError(
+                f"Timeout ao iniciar stream de candles de {asset}",
+                code=ErrorCodes.TIMEOUT,
+                broker="iqoption",
+            )
+        except KeyError as exc:
+            raise BrokerError(
+                f"Ativo {asset} ausente do catálogo IQ: {exc}",
+                code=ErrorCodes.ASSET_NOT_FOUND,
+                broker="iqoption",
+                original_error=exc,
+            )
+        except Exception as e:
+            raise BrokerError(
+                f"Failed to subscribe candles: {str(e)}",
+                code=ErrorCodes.UNKNOWN_ERROR,
+                broker="iqoption",
+                original_error=e,
+            )
 
     async def unsubscribe_candles(self, subscription_id: str) -> None:
         """
-        Cancela inscrição de candles
+        Cancela inscrição de candles. A assinatura na IQ só é encerrada
+        quando a última inscrição do par (refcount) é removida.
 
         Args:
             subscription_id: ID da inscrição
         """
-        if subscription_id in self._subscriptions:
-            self._subscriptions[subscription_id]["active"] = False
-            del self._subscriptions[subscription_id]
+        async with self._stream_lock:
+            sub = self._subscriptions.pop(subscription_id, None)
+            if not sub or not sub.get("stream"):
+                return
+            sub["active"] = False
+            interval = int(sub["timeframe"]) * 60
+            key = self._stream_key(sub["asset"], interval)
+            entry = self._streams.get(key)
+            if entry:
+                entry["refs"] = int(entry.get("refs", 0)) - 1
+                if entry["refs"] <= 0:
+                    self._streams.pop(key, None)
+                    if self._api and self._connected:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    self._stop_stream_sync, sub["asset"], interval
+                                ),
+                                timeout=10.0,
+                            )
+                        except Exception:
+                            pass
+            still_streaming = any(
+                s.get("stream") and s.get("active")
+                for s in self._subscriptions.values()
+            )
+        if not still_streaming:
+            await self._stop_stream_poll_task()
+
+    async def read_realtime_candle(
+        self, asset: str, timeframe: int
+    ) -> Optional[Candle]:
+        """
+        Lê a última vela realtime da lib sem bloquear (útil para health/
+        fallback do endpoint WebSocket). Retorna None se ainda não há
+        dados para o par.
+
+        Args:
+            asset: Ativo
+            timeframe: Timeframe em minutos
+        """
+        if not self._api or not self._connected:
+            return None
+        msg = self._read_realtime_msg_sync(asset, int(timeframe) * 60)
+        if not msg:
+            return None
+        return self._msg_to_candle(asset, int(timeframe), msg)
 
     async def place_order(self, order: OrderRequest) -> OrderResponse:
         """

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -17,6 +17,7 @@ from .core.registry.broker_registry import broker_registry
 from .core.events.event_manager import event_manager
 from .core.errors import BrokerError
 from .adapters.iqoption import IQOptionAdapter
+from .transport.websocket.candle_stream import CandleStreamSession
 from .infrastructure.database.connection_repository import connection_repository
 from .infrastructure.database.scheduled_order_repository import scheduled_order_repository
 
@@ -65,20 +66,27 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
             adapter = broker_registry.get_adapter_for_connection(connection_id)
             if not adapter:
                 return
-            db_conn = connection_repository.get_with_credentials(connection_id)
+            db_conn = await asyncio.to_thread(
+                connection_repository.get_with_credentials, connection_id
+            )
             if not db_conn or not db_conn.get("password"):
                 return
 
             connection.status = ConnectionStatus.CONNECTING
-            connection_repository.update_status(connection_id, "connecting")
+            await asyncio.to_thread(
+                connection_repository.update_status, connection_id, "connecting"
+            )
             result = await adapter.connect({
                 "email": db_conn.get("email", ""),
                 "password": db_conn.get("password", ""),
                 "account_type": connection.account_type.value if hasattr(connection.account_type, "value") else connection.account_type,
             })
             connection.status = ConnectionStatus(result["status"])
-            connection_repository.update_status(connection_id, result["status"])
-            connection_repository.log_event(
+            await asyncio.to_thread(
+                connection_repository.update_status, connection_id, result["status"]
+            )
+            await asyncio.to_thread(
+                connection_repository.log_event,
                 "connection.reconnected",
                 connection_id=connection_id,
                 event_data={"status": result["status"], "auto": True},
@@ -95,7 +103,12 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
             if conn:
                 conn.status = ConnectionStatus.ERROR
             try:
-                connection_repository.update_status(connection_id, "error", str(e))
+                await asyncio.to_thread(
+                    connection_repository.update_status,
+                    connection_id,
+                    "error",
+                    str(e),
+                )
             except Exception:
                 pass
             if attempt < max_attempts:
@@ -133,13 +146,16 @@ async def _fire_scheduled_order(row: dict) -> None:
             await asyncio.sleep(delay)
 
         # Claim atômico: só uma instância do worker dispara (pending → firing).
-        claimed = scheduled_order_repository.claim(order_id)
+        claimed = await asyncio.to_thread(
+            scheduled_order_repository.claim, order_id
+        )
         if not claimed:
             return  # cancelada por usuário ou outra instância reivindicou
 
         lateness = (datetime.now(timezone.utc) - scheduled_for).total_seconds()
         if lateness > SCHEDULED_GRACE_SEC:
-            scheduled_order_repository.finish(
+            await asyncio.to_thread(
+                scheduled_order_repository.finish,
                 order_id,
                 "missed",
                 error=f"disparo atrasado {lateness:.1f}s > {SCHEDULED_GRACE_SEC:.0f}s (worker parado?)",
@@ -153,8 +169,11 @@ async def _fire_scheduled_order(row: dict) -> None:
         connection = broker_registry.get_connection(row["connection_id"])
         adapter = broker_registry.get_adapter_for_connection(row["connection_id"])
         if not connection or not adapter:
-            scheduled_order_repository.finish(
-                order_id, "failed", error="conexão/adapter indisponível"
+            await asyncio.to_thread(
+                scheduled_order_repository.finish,
+                order_id,
+                "failed",
+                error="conexão/adapter indisponível",
             )
             return
 
@@ -168,7 +187,8 @@ async def _fire_scheduled_order(row: dict) -> None:
             connection_id=row["connection_id"],
         )
 
-        db_order = connection_repository.save_order(
+        db_order = await asyncio.to_thread(
+            connection_repository.save_order,
             connection_id=row["connection_id"],
             broker_order_id=None,
             asset=order_request.asset,
@@ -189,12 +209,14 @@ async def _fire_scheduled_order(row: dict) -> None:
                 if hasattr(result.status, "value")
                 else str(result.status)
             )
-            connection_repository.update_order(
+            await asyncio.to_thread(
+                connection_repository.update_order,
                 order_id=db_order["id"],
                 status=final_status,
                 broker_order_id=result.id,
             )
-            connection_repository.log_event(
+            await asyncio.to_thread(
+                connection_repository.log_event,
                 "order.scheduled_fired" if result.id else "order.scheduled_rejected",
                 connection_id=row["connection_id"],
                 event_data={
@@ -206,8 +228,11 @@ async def _fire_scheduled_order(row: dict) -> None:
                 },
             )
             if result.id and final_status == "accepted":
-                scheduled_order_repository.finish(
-                    order_id, "fired", broker_order_id=str(result.id)
+                await asyncio.to_thread(
+                    scheduled_order_repository.finish,
+                    order_id,
+                    "fired",
+                    broker_order_id=str(result.id),
                 )
                 dir_label = (
                     order_request.direction.value
@@ -220,32 +245,46 @@ async def _fire_scheduled_order(row: dict) -> None:
                     flush=True,
                 )
             else:
-                scheduled_order_repository.finish(
-                    order_id, "rejected", error=result.error or "rejeitada pela corretora"
+                await asyncio.to_thread(
+                    scheduled_order_repository.finish,
+                    order_id,
+                    "rejected",
+                    error=result.error or "rejeitada pela corretora",
                 )
                 print(
                     f"[Scheduled] order {order_id} REJECTED: {result.error}",
                     flush=True,
                 )
         except BrokerError as e:
-            connection_repository.update_order(
-                order_id=db_order["id"], status="rejected"
+            await asyncio.to_thread(
+                connection_repository.update_order,
+                order_id=db_order["id"],
+                status="rejected",
             )
-            scheduled_order_repository.finish(order_id, "rejected", error=str(e))
+            await asyncio.to_thread(
+                scheduled_order_repository.finish, order_id, "rejected", error=str(e)
+            )
             print(f"[Scheduled] order {order_id} REJECTED: {e}", flush=True)
 
     except asyncio.CancelledError:
         # Shutdown no meio do caminho: não deixar linha presa em 'firing'.
+        # (cancel pode chegar de novo durante o await; a próxima limpeza do
+        # worker via fail_firing cobre o caso de a escrita ser abortada.)
         try:
-            scheduled_order_repository.finish(
-                order_id, "failed", error="worker reiniciado durante o disparo"
+            await asyncio.to_thread(
+                scheduled_order_repository.finish,
+                order_id,
+                "failed",
+                error="worker reiniciado durante o disparo",
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
         raise
     except Exception as e:
         try:
-            scheduled_order_repository.finish(order_id, "failed", error=str(e))
+            await asyncio.to_thread(
+                scheduled_order_repository.finish, order_id, "failed", error=str(e)
+            )
         except Exception:
             pass
         print(f"[Scheduled] order {order_id} FAILED: {e}", flush=True)
@@ -265,7 +304,9 @@ async def _scheduled_orders_worker() -> None:
     # Linhas presas em 'firing' de um crash anterior → failed (nunca re-dispara
     # sozinhas; o usuário pode reagendar).
     try:
-        n = scheduled_order_repository.fail_firing("worker reiniciado antes do disparo")
+        n = await asyncio.to_thread(
+            scheduled_order_repository.fail_firing, "worker reiniciado antes do disparo"
+        )
         if n:
             print(f"[Scheduled] {n} linha(s) 'firing' órfãs marcadas como failed", flush=True)
     except Exception as e:
@@ -274,8 +315,10 @@ async def _scheduled_orders_worker() -> None:
     try:
         while True:
             try:
-                rows = scheduled_order_repository.list(
-                    statuses=["pending"], limit=500
+                rows = await asyncio.to_thread(
+                    scheduled_order_repository.list,
+                    statuses=["pending"],
+                    limit=500,
                 )
                 for row in rows:
                     rid = row["id"]
@@ -402,7 +445,7 @@ app.add_middleware(
 async def health_check():
     """Health check endpoint"""
     try:
-        db = connection_repository.list_all()
+        db = await asyncio.to_thread(connection_repository.list_all)
         db_status = "connected"
     except Exception:
         db_status = "disconnected"
@@ -442,7 +485,9 @@ async def list_connections(user_id: Optional[str] = None):
     """Lista conexões (escopo multi-tenant via ?user_id=)"""
     # Get from database (includes persisted connections)
     try:
-        db_connections = connection_repository.list_all(user_id=user_id or None)
+        db_connections = await asyncio.to_thread(
+            connection_repository.list_all, user_id=user_id or None
+        )
         return {"connections": db_connections}
     except Exception:
         # Fallback to in-memory registry
@@ -549,7 +594,7 @@ async def create_connection(config: ConnectRequest):
 async def get_connection(connection_id: str):
     """Obtém detalhes de uma conexão"""
     # Try database first
-    db_conn = connection_repository.get_by_id(connection_id)
+    db_conn = await asyncio.to_thread(connection_repository.get_by_id, connection_id)
     if db_conn:
         return db_conn
     
@@ -797,7 +842,7 @@ async def get_connection_status(connection_id: str):
     status = await adapter.get_status()
     
     # Update database heartbeat
-    connection_repository.update_heartbeat(connection_id)
+    await asyncio.to_thread(connection_repository.update_heartbeat, connection_id)
     
     return status
 
@@ -815,7 +860,9 @@ async def get_account(connection_id: str):
     
     # Auto-connect if adapter is not connected (e.g. after server reload)
     if not adapter._connected:
-        db_conn = connection_repository.get_with_credentials(connection_id)
+        db_conn = await asyncio.to_thread(
+            connection_repository.get_with_credentials, connection_id
+        )
         if db_conn:
             try:
                 await adapter.connect({
@@ -868,7 +915,9 @@ async def get_balance(connection_id: str):
     
     # Auto-connect if adapter is not connected (e.g. after server reload)
     if not adapter._connected:
-        db_conn = connection_repository.get_with_credentials(connection_id)
+        db_conn = await asyncio.to_thread(
+            connection_repository.get_with_credentials, connection_id
+        )
         if db_conn:
             try:
                 await adapter.connect({
@@ -968,6 +1017,35 @@ async def get_candles(
         return {"candles": [c.model_dump() for c in candles]}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.websocket("/ws/connections/{connection_id}")
+async def ws_connection_candles(websocket: WebSocket, connection_id: str):
+    """Streaming de candles em tempo real (canal candle-generated da IQ).
+
+    Fallback automático para polling REST (get_candles) quando o stream
+    não entrega dados. Protocolo completo: ver
+    src/transport/websocket/candle_stream.py
+    """
+    connection = broker_registry.get_connection(connection_id)
+    adapter = broker_registry.get_adapter_for_connection(connection_id)
+    await websocket.accept()
+
+    if not connection:
+        await websocket.send_json(
+            {"type": "error", "message": "Connection not found"}
+        )
+        await websocket.close(code=4404)
+        return
+    if not adapter:
+        await websocket.send_json({"type": "error", "message": "Not connected"})
+        await websocket.close(code=4400)
+        return
+
+    await websocket.send_json(
+        {"type": "ready", "connection_id": connection_id}
+    )
+    await CandleStreamSession(websocket, connection_id, adapter).run()
 
 
 @app.post("/connections/{connection_id}/orders")
