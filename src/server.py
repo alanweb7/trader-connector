@@ -121,7 +121,11 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
 # Máximo de atraso aceito após scheduled_for — além disso marca 'missed'.
 SCHEDULED_GRACE_SEC = float(os.getenv("SCHEDULED_GRACE_SEC", "20"))
 # Intervalo de sincronização com o banco (novas linhas pending).
-SCHEDULED_POLL_SEC = float(os.getenv("SCHEDULED_POLL_SEC", "1.0"))
+# 10s (não 1s): cada tick é uma requisição REST ao Supabase — a 1s este worker
+# sozinho gerava ~86k req/dia e estourava a quota de ingestão de logs do plano
+# gratuito. Com GRACE=20s, a pior latência de detecção (10s) continua dentro
+# da tolerância de disparo. Override via env SCHEDULED_POLL_SEC.
+SCHEDULED_POLL_SEC = float(os.getenv("SCHEDULED_POLL_SEC", "10.0"))
 
 _scheduled_tasks: "dict[str, asyncio.Task]" = {}
 
