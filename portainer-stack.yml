@@ -35,6 +35,9 @@ services:
       # Supabase e estourava a quota de logs do plano gratuito.
       # Efeito colateral: ordens agendadas disparam com atraso de ate 50s.
       - SCHEDULED_POLL_SEC=${SCHEDULED_POLL_SEC:-50}
+      # Agendamento de ordens: desligado por enquanto (fila vazia). Para reativar
+      # na fase de maturacao, mude para 1 no .env.portainer.
+      - SCHEDULED_ORDERS_ENABLED=${SCHEDULED_ORDERS_ENABLED:-0}
     networks:
       - traefik_public
     deploy:

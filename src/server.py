@@ -126,6 +126,15 @@ SCHEDULED_GRACE_SEC = float(os.getenv("SCHEDULED_GRACE_SEC", "20"))
 # gratuito. Com GRACE=20s, a pior latência de detecção (10s) continua dentro
 # da tolerância de disparo. Override via env SCHEDULED_POLL_SEC.
 SCHEDULED_POLL_SEC = float(os.getenv("SCHEDULED_POLL_SEC", "10.0"))
+# Desligado por enquanto: agendamento ainda não é usado (fila vazia) e o polling
+# custava ~86k req/dia no Supabase. Código, tabela e endpoints continuam no
+# projeto — ligue de novo com SCHEDULED_ORDERS_ENABLED=1.
+SCHEDULED_ORDERS_ENABLED = os.getenv("SCHEDULED_ORDERS_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 _scheduled_tasks: "dict[str, asyncio.Task]" = {}
 
@@ -395,7 +404,15 @@ async def lifespan(app: FastAPI):
         print(f"[BrokerGateway] Warning: Could not load connections from database: {e}")
 
     # Worker de ordens agendadas (próxima vela / horário fixo)
-    scheduled_worker_task = asyncio.create_task(_scheduled_orders_worker())
+    scheduled_worker_task = None
+    if SCHEDULED_ORDERS_ENABLED:
+        scheduled_worker_task = asyncio.create_task(_scheduled_orders_worker())
+    else:
+        print(
+            "[BrokerGateway] scheduled-orders worker DESLIGADO "
+            "(SCHEDULED_ORDERS_ENABLED=0)",
+            flush=True,
+        )
 
     yield
     
@@ -403,11 +420,12 @@ async def lifespan(app: FastAPI):
     print("[BrokerGateway] Shutting down...")
 
     # Para o worker de agendamento (disparos em andamento marcam 'failed')
-    scheduled_worker_task.cancel()
-    try:
-        await scheduled_worker_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    if scheduled_worker_task:
+        scheduled_worker_task.cancel()
+        try:
+            await scheduled_worker_task
+        except (asyncio.CancelledError, Exception):
+            pass
     
     # Desconnect all active connections
     for connection in broker_registry.list_connections():
@@ -1187,6 +1205,11 @@ class ScheduledOrderCreate(BaseModel):
 @app.post("/scheduled-orders")
 async def create_scheduled_order(body: ScheduledOrderCreate):
     """Cria uma ordem agendada (worker dispara em scheduled_for)."""
+    if not SCHEDULED_ORDERS_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Agendamento de ordens temporariamente desativado",
+        )
     connection = broker_registry.get_connection(body.connection_id)
     if not connection:
         raise HTTPException(status_code=404, detail="Connection not found")
