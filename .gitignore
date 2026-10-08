@@ -61,3 +61,11 @@ logs/
 server.log
 server.log.err
 
+# Opencode / agent skills (tooling local)
+.agents/
+opencode.json
+skills-lock.json
+
+# Lixo Windows (redirect para dispositivo reservado)
+nul
+
