@@ -1,21 +1,40 @@
 version: "3.7"
 
+# =============================================================================
+# Deploy no Portainer:
+#   1) Stacks -> Update (ou Add stack) -> cole este arquivo no Web editor
+#   2) Em "Environment variables", cole o conteudo de .env.portainer
+#      (ou use o botao "Load variables from file" apontando para ele)
+#   3) Update the stack
+#
+# NENHUM valor fica neste arquivo — so ${VAR}. O arquivo .env.portainer
+# (gitignored) contem os valores e vai para o painel de env do Portainer.
+# =============================================================================
+
 services:
   broker-gateway:
     image: ghcr.io/alanweb7/trader-connector:latest
     container_name: broker-gateway
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    # SEM porta publicada de proposito:
+    # - "8000:8000" expunha o gateway direto na internet (risco) e fazia o
+    #   Traefik (provedor swarm) escolher o IP da rede `ingress` como alvo,
+    #   inalcancavel de dentro dos containers -> 504 em todo /health.
+    # Acesso externo somente via Traefik (connector.ticketpay.app.br).
+    # Para debug local temporario: - "127.0.0.1:8000:8000"
     environment:
-      - IQOPTION_EMAIL=99tisistemas@gmail.com
-      - IQOPTION_PASSWORD=@seguro#LIVE332
-      - IQOPTION_ACCOUNT_TYPE=practice
-      - PORT=8000
-      - HOST=0.0.0.0
-      # 10s (não 1s): poll do worker de ordens agendadas — a 1s gerava
-      # ~86k req/dia no Supabase e estourava a quota de logs do plano free.
-      - SCHEDULED_POLL_SEC=10
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - IQOPTION_EMAIL=${IQOPTION_EMAIL}
+      - IQOPTION_PASSWORD=${IQOPTION_PASSWORD}
+      - IQOPTION_ACCOUNT_TYPE=${IQOPTION_ACCOUNT_TYPE:-practice}
+      - PORT=${PORT:-8000}
+      - HOST=${HOST:-0.0.0.0}
+      # Poll do worker de ordens agendadas. A 1s gerava ~86k req/dia no
+      # Supabase e estourava a quota de logs do plano gratuito.
+      # Efeito colateral: ordens agendadas disparam com atraso de ate 50s.
+      - SCHEDULED_POLL_SEC=${SCHEDULED_POLL_SEC:-50}
     networks:
       - traefik_public
     deploy:
