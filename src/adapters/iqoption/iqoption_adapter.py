@@ -3,6 +3,7 @@ Adapter para IQ Option
 Utiliza a biblioteca iqoptionapi para conexão com a plataforma
 """
 import asyncio
+import os
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -29,7 +30,14 @@ from ...core.errors import BrokerError, ErrorCodes
 
 
 class IQOptionAdapter(BrokerAdapter):
-    """Adapter para IQ Option"""
+    """Adapter para IQ Option (e white-labels Quadcode, ex: Polarium)"""
+
+    # Nome do broker nas respostas/erros. Subclasses (ex: PolariumAdapter)
+    # sobrescrevem para identificar a corretora corretamente.
+    BROKER_NAME = "iqoption"
+    # Perfil Quadcode usado quando config["broker_profile"] não é informado
+    # (None = default do quadcode_compat: env BROKER_PROFILE ou "iqoption").
+    default_broker_profile: Optional[str] = None
 
     def __init__(self):
         self._api = None
@@ -42,6 +50,10 @@ class IQOptionAdapter(BrokerAdapter):
         self._subscriptions: Dict[str, Dict[str, Any]] = {}
         self._email: Optional[str] = None
         self._password: Optional[str] = None
+        # Sessão white-label (Quadcode): SSID pré-extraído, host e perfil
+        self._ssid: Optional[str] = None
+        self._host: Optional[str] = None
+        self._broker_profile: Optional[str] = None
         self._cached_balance = 0.0
         self._cached_profile = {}
         # Cache de get_all_init_v2 (turbo/binary actives) — evita bloquear
@@ -69,9 +81,8 @@ class IQOptionAdapter(BrokerAdapter):
         # Task periódica: mantém cache de ativos quente e detecta queda de
         # sessão (auto-heal com backoff).
         self._refresh_task: Optional[asyncio.Task] = None
-        import os as _os
         try:
-            self._refresh_interval_sec = float(_os.environ.get("IQ_REFRESH_SEC", "300"))
+            self._refresh_interval_sec = float(os.environ.get("IQ_REFRESH_SEC", "300"))
         except ValueError:
             self._refresh_interval_sec = 300.0
 
@@ -149,20 +160,37 @@ class IQOptionAdapter(BrokerAdapter):
         """
         async with self._login_lock:
             try:
-                from iqoptionapi.stable_api import IQ_Option
+                from .quadcode_compat import apply_patches, create_iq_option
 
                 self._email = config.get("email")
                 self._password = config.get("password")
+                # White-label Quadcode (ex: Polarium): SSID pré-extraído,
+                # host e perfil do broker (ver quadcode_compat)
+                self._ssid = config.get("ssid")
+                self._host = config.get("host")
+                self._broker_profile = (
+                    config.get("broker_profile")
+                    or self.default_broker_profile
+                    or os.environ.get("BROKER_PROFILE")
+                )
                 account_type = config.get("account_type", "practice")
 
-                if not self._email or not self._password:
+                if not self._ssid and (not self._email or not self._password):
                     raise BrokerError(
-                        "Email and password are required",
+                        "Email and password are required (or ssid for "
+                        "white-label Quadcode sessions)",
                         code=ErrorCodes.INVALID_CREDENTIALS,
-                        broker="iqoption",
+                        broker=self.BROKER_NAME,
                     )
 
-                self._api = IQ_Option(self._email, self._password)
+                apply_patches()
+                self._api = create_iq_option(
+                    email=self._email,
+                    password=self._password,
+                    ssid=self._ssid,
+                    broker_profile=self._broker_profile,
+                    host=self._host,
+                )
 
                 # Connect - roda em background thread, o while loop da lib
                 # pode demorar mas vai completar quando o WebSocket receber dados.
@@ -193,7 +221,7 @@ class IQOptionAdapter(BrokerAdapter):
                     raise BrokerError(
                         reason,
                         code=ErrorCodes.INVALID_CREDENTIALS,
-                        broker="iqoption",
+                        broker=self.BROKER_NAME,
                     )
 
                 # Verificar se está conectado
@@ -210,7 +238,7 @@ class IQOptionAdapter(BrokerAdapter):
                         raise BrokerError(
                             reason,
                             code=ErrorCodes.CONNECTION_FAILED,
-                            broker="iqoption",
+                            broker=self.BROKER_NAME,
                         )
                 except asyncio.TimeoutError:
                     self._api = None
@@ -219,7 +247,7 @@ class IQOptionAdapter(BrokerAdapter):
                     raise BrokerError(
                         "Connection check timeout: IQ Option não confirmou o WebSocket em 30s.",
                         code=ErrorCodes.TIMEOUT,
-                        broker="iqoption",
+                        broker=self.BROKER_NAME,
                     )
 
                 self._connected = True
@@ -247,7 +275,7 @@ class IQOptionAdapter(BrokerAdapter):
                     raise BrokerError(
                         f"Failed to switch to {balance_mode} account",
                         code=ErrorCodes.CONNECTION_FAILED,
-                        broker="iqoption",
+                        broker=self.BROKER_NAME,
                         original_error=last_err,
                     )
 
@@ -277,7 +305,7 @@ class IQOptionAdapter(BrokerAdapter):
 
                 return {
                     "status": ConnectionStatus.READY.value,
-                    "broker": "iqoption",
+                    "broker": self.BROKER_NAME,
                     "account_type": account_type,
                     "balance_mode": balance_mode,
                     "message": "Connected successfully",
@@ -287,7 +315,7 @@ class IQOptionAdapter(BrokerAdapter):
                 raise BrokerError(
                     "iqoptionapi library not installed. Run: pip install iqoptionapi",
                     code=ErrorCodes.NOT_SUPPORTED,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
             except BrokerError:
                 raise
@@ -299,7 +327,7 @@ class IQOptionAdapter(BrokerAdapter):
                 raise BrokerError(
                     self._format_connect_error(e),
                     code=ErrorCodes.CONNECTION_FAILED,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                     original_error=e,
                 )
 
@@ -427,9 +455,25 @@ class IQOptionAdapter(BrokerAdapter):
             print("[IQOption] refresh task cancelada", flush=True)
             raise
 
+    def _session_config(self, account_type: str) -> Dict[str, Any]:
+        """Config de connect() para auto-heal/reconnect — preserva ssid,
+        host e perfil Quadcode usados na sessão original."""
+        config: Dict[str, Any] = {
+            "email": self._email,
+            "password": self._password,
+            "account_type": account_type,
+        }
+        if self._ssid:
+            config["ssid"] = self._ssid
+        if self._host:
+            config["host"] = self._host
+        if self._broker_profile:
+            config["broker_profile"] = self._broker_profile
+        return config
+
     async def _heal_reconnect(self) -> None:
         """Derruba a sessão morta e reconecta com as credenciais em cache."""
-        if not self._email or not self._password:
+        if not self._ssid and not (self._email and self._password):
             return
         if self._api:
             try:
@@ -445,13 +489,7 @@ class IQOptionAdapter(BrokerAdapter):
             else str(self._account_type or "practice")
         )
         try:
-            await self.connect(
-                {
-                    "email": self._email,
-                    "password": self._password,
-                    "account_type": account_type,
-                }
-            )
+            await self.connect(self._session_config(account_type))
             print("[IQOption] auto-heal: reconectado com sucesso", flush=True)
         except Exception as e:
             print(f"[IQOption] auto-heal falhou: {e!r}", flush=True)
@@ -471,7 +509,7 @@ class IQOptionAdapter(BrokerAdapter):
             is_connected = await asyncio.to_thread(self._api.check_connect)
             return {
                 "status": ConnectionStatus.READY.value if is_connected else ConnectionStatus.DISCONNECTED.value,
-                "broker": "iqoption",
+                "broker": self.BROKER_NAME,
                 "account_type": self._account_type.value,
             }
         except Exception as e:
@@ -500,7 +538,7 @@ class IQOptionAdapter(BrokerAdapter):
                 currency = result.get("currency") or profile_msg.get("currency") or "USD"
                 return Account(
                     id=str(acc_id),
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                     type=self._account_type,
                     currency=currency,
                     status=ConnectionStatus.READY,
@@ -508,7 +546,7 @@ class IQOptionAdapter(BrokerAdapter):
 
             return Account(
                 id="",
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 type=self._account_type,
                 currency="USD",
                 status=ConnectionStatus.READY,
@@ -517,7 +555,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Failed to get account: {str(e)}",
                 code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=e,
             )
 
@@ -568,7 +606,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Failed to get balance: {str(e)}",
                 code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=e,
             )
 
@@ -877,7 +915,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Failed to get assets: {str(e)}",
                 code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=e,
             )
 
@@ -937,7 +975,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Asset {symbol} not found",
                 code=ErrorCodes.ASSET_NOT_FOUND,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
             )
 
         except BrokerError:
@@ -946,7 +984,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Failed to get asset: {str(e)}",
                 code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=e,
             )
 
@@ -1047,7 +1085,7 @@ class IQOptionAdapter(BrokerAdapter):
                     f"Ativo {asset} indisponível nesta conta "
                     "(ausente do catálogo IQ)",
                     code=ErrorCodes.ASSET_NOT_FOUND,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
 
             # Obter timestamp final
@@ -1080,7 +1118,7 @@ class IQOptionAdapter(BrokerAdapter):
                     f"Timeout: IQ Option não respondeu candles de "
                     f"{asset} em 20s",
                     code=ErrorCodes.UNKNOWN_ERROR,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
 
             candles = []
@@ -1107,7 +1145,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Failed to get candles: {str(e)}",
                 code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=e,
             )
 
@@ -1168,7 +1206,7 @@ class IQOptionAdapter(BrokerAdapter):
                 raise BrokerError(
                     f"Falha ao assinar stream de candles de {active}: {exc}",
                     code=ErrorCodes.WEBSOCKET_ERROR,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                     original_error=exc,
                 )
             _t.sleep(1.0)
@@ -1336,7 +1374,7 @@ class IQOptionAdapter(BrokerAdapter):
                     f"IQ Option (intervalos válidos em segundos: "
                     f"{getattr(self._api, 'size', [])})",
                     code=ErrorCodes.NOT_SUPPORTED,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
             # Garante mapeamento symbol -> active_id (senão KeyError no canal)
             if not self._init_v2_cache:
@@ -1349,7 +1387,7 @@ class IQOptionAdapter(BrokerAdapter):
                     f"Ativo {asset} indisponível nesta conta "
                     "(ausente do catálogo IQ)",
                     code=ErrorCodes.ASSET_NOT_FOUND,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
 
             subscription_id = str(uuid4())
@@ -1391,20 +1429,20 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Timeout ao iniciar stream de candles de {asset}",
                 code=ErrorCodes.TIMEOUT,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
             )
         except KeyError as exc:
             raise BrokerError(
                 f"Ativo {asset} ausente do catálogo IQ: {exc}",
                 code=ErrorCodes.ASSET_NOT_FOUND,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=exc,
             )
         except Exception as e:
             raise BrokerError(
                 f"Failed to subscribe candles: {str(e)}",
                 code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=e,
             )
 
@@ -1486,12 +1524,12 @@ class IQOptionAdapter(BrokerAdapter):
                         f"Ativo {order.asset} suspenso pela IQ Option "
                         f"(horário/mercado). Escolha outro ativo.",
                         code=ErrorCodes.MARKET_CLOSED,
-                        broker="iqoption",
+                        broker=self.BROKER_NAME,
                     )
                 raise BrokerError(
                     f"Ativo {order.asset} fechado no momento",
                     code=ErrorCodes.MARKET_CLOSED,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
             if asset_data is None and not self._is_otc(order.asset):
                 # Ativo regular não encontrado no book em nenhum bucket:
@@ -1499,7 +1537,7 @@ class IQOptionAdapter(BrokerAdapter):
                 raise BrokerError(
                     f"Ativo {order.asset} não encontrado ou mercado fechado",
                     code=ErrorCodes.MARKET_CLOSED,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
             # OTC não encontrado no book: segue a operação mesmo assim e
             # deixa a IQ Option responder (rejeição real, se houver).
@@ -1516,7 +1554,7 @@ class IQOptionAdapter(BrokerAdapter):
                 return OrderResponse(
                     id=order_id,
                     status=OrderStatus.ACCEPTED,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                     connection_id=order.connection_id,
                     request_id=order.request_id,
                     idempotency_key=order.idempotency_key,
@@ -1530,7 +1568,7 @@ class IQOptionAdapter(BrokerAdapter):
                 print(f"[IQOption] order rejected for {order.asset}: reason={reason!r}")
                 return OrderResponse(
                     status=OrderStatus.REJECTED,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                     connection_id=order.connection_id,
                     request_id=order.request_id,
                     idempotency_key=order.idempotency_key,
@@ -1543,7 +1581,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 f"Failed to place order: {str(e)}",
                 code=ErrorCodes.ORDER_REJECTED,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=e,
             )
 
@@ -1579,7 +1617,7 @@ class IQOptionAdapter(BrokerAdapter):
                 raise BrokerError(
                     f"Unknown active: {symbol}",
                     code=ErrorCodes.ASSET_NOT_FOUND,
-                    broker="iqoption",
+                    broker=self.BROKER_NAME,
                 )
             api_raw.buyv3(float(amount), active_id, direction, int(expiration), req_id)
 
@@ -1609,7 +1647,7 @@ class IQOptionAdapter(BrokerAdapter):
         raise BrokerError(
             "Order cancellation not supported by IQ Option",
             code=ErrorCodes.NOT_SUPPORTED,
-            broker="iqoption",
+            broker=self.BROKER_NAME,
         )
 
     async def _ensure_live_session(self) -> None:
@@ -1628,11 +1666,7 @@ class IQOptionAdapter(BrokerAdapter):
 
         print("[IQOption] WebSocket morto ao consultar ordem — reconectando...", flush=True)
         auth_type = self._account_type.value if hasattr(self._account_type, 'value') else str(self._account_type)
-        await self.connect({
-            "email": self._email,
-            "password": self._password,
-            "account_type": auth_type,
-        })
+        await self.connect(self._session_config(auth_type))
 
     async def get_order(self, order_id: str) -> OrderResponse:
         """
@@ -1649,12 +1683,12 @@ class IQOptionAdapter(BrokerAdapter):
             return OrderResponse(
                 id=order_id,
                 status=OrderStatus.CLOSED,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
             )
         return OrderResponse(
             id=order_id,
             status=OrderStatus.OPEN,
-            broker="iqoption",
+            broker=self.BROKER_NAME,
         )
 
     async def get_order_result(self, order_id: str) -> OrderResult:
@@ -1704,14 +1738,14 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 "Timed out waiting for order result",
                 code=ErrorCodes.TIMEOUT,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
             )
 
         if holder.get("error"):
             raise BrokerError(
                 f"Failed to get order result: {holder['error']}",
                 code=ErrorCodes.UNKNOWN_ERROR,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
                 original_error=holder["error"],
             )
 
@@ -1743,7 +1777,7 @@ class IQOptionAdapter(BrokerAdapter):
             raise BrokerError(
                 "Not connected to IQ Option",
                 code=ErrorCodes.CONNECTION_FAILED,
-                broker="iqoption",
+                broker=self.BROKER_NAME,
             )
 
     @staticmethod

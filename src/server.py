@@ -17,6 +17,7 @@ from .core.registry.broker_registry import broker_registry
 from .core.events.event_manager import event_manager
 from .core.errors import BrokerError
 from .adapters.iqoption import IQOptionAdapter
+from .adapters.polarium import PolariumAdapter
 from .transport.websocket.candle_stream import CandleStreamSession
 from .infrastructure.database.connection_repository import connection_repository
 from .infrastructure.database.scheduled_order_repository import scheduled_order_repository
@@ -27,11 +28,18 @@ load_dotenv()
 
 # Modelos para request/response
 class ConnectRequest(BaseModel):
-    email: str
-    password: str
+    # Credenciais: email+password OU apenas ssid (white-label Quadcode)
+    email: Optional[str] = None
+    password: Optional[str] = None
     account_type: str = "practice"
     name: Optional[str] = None
     user_id: Optional[str] = None
+    # Broker registry name: "iqoption" (default) | "polarium" | ...
+    broker: str = "iqoption"
+    # Sessão white-label via SSID pré-extraído (autentica sem senha)
+    ssid: Optional[str] = None
+    # Override do host WebSocket (raramente necessário — vem do perfil)
+    host: Optional[str] = None
 
 
 class UpdateConnectionRequest(BaseModel):
@@ -367,8 +375,9 @@ async def lifespan(app: FastAPI):
     # Startup
     print("[BrokerGateway] Starting up...")
     
-    # Registrar adapter IQ Option
+    # Registrar adapters IQ Option e white-labels Quadcode
     broker_registry.register("iqoption", IQOptionAdapter())
+    broker_registry.register("polarium", PolariumAdapter())
     
     print("[BrokerGateway] Registered adapters:", broker_registry.list_brokers())
     
@@ -522,6 +531,17 @@ async def list_connections(user_id: Optional[str] = None):
 @app.post("/connections", response_model=ConnectionResponse)
 async def create_connection(config: ConnectRequest):
     """Cria uma nova conexão e conecta ao broker"""
+    # Validação antes do try (status codes preservados)
+    if not config.ssid and (not config.email or not config.password):
+        raise HTTPException(
+            status_code=422,
+            detail="email+password or ssid is required",
+        )
+    if not broker_registry.has(config.broker):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown broker: {config.broker}",
+        )
     try:
         # Generate connection name if not provided
         conn_name = config.name or f"{config.account_type.title()} Account"
@@ -529,9 +549,9 @@ async def create_connection(config: ConnectRequest):
         # Save to database first
         db_conn = connection_repository.create(
             name=conn_name,
-            broker="iqoption",
-            email=config.email,
-            password=config.password,
+            broker=config.broker,
+            email=config.email or "",
+            password=config.password or "",
             account_type=config.account_type,
             user_id=config.user_id or None,
         )
@@ -539,7 +559,7 @@ async def create_connection(config: ConnectRequest):
 
         # Create in-memory connection
         connection = Connection(
-            broker="iqoption",
+            broker=config.broker,
             account_type=config.account_type,
         )
         connection.id = connection_id
@@ -553,7 +573,7 @@ async def create_connection(config: ConnectRequest):
         connection_repository.log_event(
             "connection.created",
             connection_id=connection_id,
-            event_data={"broker": "iqoption", "account_type": config.account_type},
+            event_data={"broker": config.broker, "account_type": config.account_type},
         )
 
         # Connect to broker — usa o adapter dedicado desta connection (sessão isolada)
@@ -564,6 +584,8 @@ async def create_connection(config: ConnectRequest):
             "email": config.email,
             "password": config.password,
             "account_type": config.account_type,
+            "ssid": config.ssid,
+            "host": config.host,
         })
         
         # Update status
@@ -581,7 +603,7 @@ async def create_connection(config: ConnectRequest):
         # Emit event
         await event_manager.emit("connection.created", {
             "connection_id": connection_id,
-            "broker": "iqoption",
+            "broker": config.broker,
             "status": result["status"],
         })
         
