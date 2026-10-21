@@ -35,6 +35,7 @@ class ConnectionRepository:
         account_type: str = "practice",
         user_id: Optional[str] = None,
         server: Optional[str] = None,
+        ssid: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Create a new broker connection
@@ -47,6 +48,7 @@ class ConnectionRepository:
             account_type: 'practice', 'real', or 'demo'
             user_id: Optional user ID for multi-tenant
             server: Optional server identifier
+            ssid: Optional Quadcode session ssid (reconnect without password)
             
         Returns:
             Created connection record
@@ -73,8 +75,19 @@ class ConnectionRepository:
         
         if user_id:
             data["user_id"] = user_id
+        if ssid:
+            data["ssid_encrypted"] = ssid
         
-        result = db.table("broker_connections").insert(data).execute()
+        try:
+            result = db.table("broker_connections").insert(data).execute()
+        except Exception as e:
+            if ssid and "ssid_encrypted" in str(e):
+                raise Exception(
+                    "Coluna ssid_encrypted ausente no banco — aplique a migration "
+                    "supabase/migrations/20261020000000_add_ssid_to_broker_connections.sql "
+                    "no SQL Editor do Supabase"
+                ) from e
+            raise
         
         if result.data:
             return result.data[0]
@@ -182,6 +195,26 @@ class ConnectionRepository:
         # Remove raw encrypted fields
         record.pop("email_encrypted", None)
         record.pop("password_encrypted", None)
+        
+        # SSID de sessão (white-label Quadcode) — decripta com fallback ao valor cru
+        ssid_raw = record.pop("ssid_encrypted", None)
+        record["ssid"] = ""
+        if ssid_raw:
+            try:
+                ssid_dec = db.rpc(
+                    "decrypt_broker_ssid",
+                    {
+                        "p_ssid_encrypted": ssid_raw,
+                        "p_encryption_key": self.encryption_key,
+                    },
+                ).execute()
+                if ssid_dec.data:
+                    record["ssid"] = ssid_dec.data[0].get("ssid", "") or ""
+                else:
+                    record["ssid"] = ssid_raw
+            except Exception:
+                # Fallback: RPC ausente (migration não aplicada) ou valor cru
+                record["ssid"] = ssid_raw
         
         return record
 

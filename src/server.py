@@ -77,7 +77,9 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
             db_conn = await asyncio.to_thread(
                 connection_repository.get_with_credentials, connection_id
             )
-            if not db_conn or not db_conn.get("password"):
+            if not db_conn or not (
+                db_conn.get("password") or db_conn.get("ssid")
+            ):
                 return
 
             connection.status = ConnectionStatus.CONNECTING
@@ -87,6 +89,7 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
             result = await adapter.connect({
                 "email": db_conn.get("email", ""),
                 "password": db_conn.get("password", ""),
+                "ssid": db_conn.get("ssid") or None,
                 "account_type": connection.account_type.value if hasattr(connection.account_type, "value") else connection.account_type,
             })
             connection.status = ConnectionStatus(result["status"])
@@ -554,6 +557,7 @@ async def create_connection(config: ConnectRequest):
             password=config.password or "",
             account_type=config.account_type,
             user_id=config.user_id or None,
+            ssid=config.ssid,
         )
         connection_id = db_conn["id"]
 
@@ -786,6 +790,7 @@ async def connect_connection(connection_id: str):
         result = await adapter.connect({
             "email": db_conn.get("email", ""),
             "password": db_conn.get("password", ""),
+            "ssid": db_conn.get("ssid") or None,
             "account_type": connection.account_type.value if hasattr(connection.account_type, 'value') else connection.account_type,
         })
         
