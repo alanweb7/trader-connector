@@ -184,6 +184,9 @@ class Connection(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     last_heartbeat: Optional[datetime] = None
     error: Optional[str] = None
+    # Nome exibido (ex.: "B3 Sandbox MT5"). Mantido no modelo em memória para
+    # que o fallback de /connections (quando o banco falha) não perca o rótulo.
+    name: Optional[str] = None
 
     class Config:
         use_enum_values = True

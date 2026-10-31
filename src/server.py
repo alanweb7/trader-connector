@@ -18,12 +18,17 @@ from .core.events.event_manager import event_manager
 from .core.errors import BrokerError
 from .adapters.iqoption import IQOptionAdapter
 from .adapters.polarium import PolariumAdapter
+from .adapters.mt5 import MT5BridgeAdapter
 from .transport.websocket.candle_stream import CandleStreamSession
 from .infrastructure.database.connection_repository import connection_repository
 from .infrastructure.database.scheduled_order_repository import scheduled_order_repository
 
 # Carregar variáveis de ambiente
 load_dotenv()
+
+# Brokers "somente dados" (mt5 = ponte p/ API local MetaTrader 5): não têm
+# credenciais próprias — a autenticação é a sessão do terminal na VPS.
+DATA_ONLY_BROKERS = {"mt5"}
 
 
 # Modelos para request/response
@@ -77,9 +82,11 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
             db_conn = await asyncio.to_thread(
                 connection_repository.get_with_credentials, connection_id
             )
-            if not db_conn or not (
+            if not db_conn:
+                return
+            if not (
                 db_conn.get("password") or db_conn.get("ssid")
-            ):
+            ) and connection.broker not in DATA_ONLY_BROKERS:
                 return
 
             connection.status = ConnectionStatus.CONNECTING
@@ -381,6 +388,8 @@ async def lifespan(app: FastAPI):
     # Registrar adapters IQ Option e white-labels Quadcode
     broker_registry.register("iqoption", IQOptionAdapter())
     broker_registry.register("polarium", PolariumAdapter())
+    # B3 via API local MetaTrader 5 (ponte HTTP/WS — somente dados)
+    broker_registry.register("mt5", MT5BridgeAdapter())
     
     print("[BrokerGateway] Registered adapters:", broker_registry.list_brokers())
     
@@ -393,6 +402,7 @@ async def lifespan(app: FastAPI):
             connection = Connection(
                 broker=conn["broker"],
                 account_type=conn["account_type"],
+                name=conn.get("name"),
             )
             connection.id = conn["id"]
             connection.status = ConnectionStatus.DISCONNECTED
@@ -535,7 +545,12 @@ async def list_connections(user_id: Optional[str] = None):
 async def create_connection(config: ConnectRequest):
     """Cria uma nova conexão e conecta ao broker"""
     # Validação antes do try (status codes preservados)
-    if not config.ssid and (not config.email or not config.password):
+    # Brokers somente dados (mt5) não têm credenciais próprias.
+    if (
+        config.broker not in DATA_ONLY_BROKERS
+        and not config.ssid
+        and (not config.email or not config.password)
+    ):
         raise HTTPException(
             status_code=422,
             detail="email+password or ssid is required",
@@ -565,6 +580,7 @@ async def create_connection(config: ConnectRequest):
         connection = Connection(
             broker=config.broker,
             account_type=config.account_type,
+            name=conn_name,
         )
         connection.id = connection_id
         connection.status = ConnectionStatus.CONNECTING
@@ -766,6 +782,7 @@ async def connect_connection(connection_id: str):
         connection = Connection(
             broker=db_conn["broker"],
             account_type=db_conn["account_type"],
+            name=db_conn.get("name"),
         )
         connection.id = connection_id
         connection.status = ConnectionStatus.DISCONNECTED

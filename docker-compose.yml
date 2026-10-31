@@ -8,8 +8,13 @@ services:
     environment:
       - PORT=8000
       - HOST=0.0.0.0
+      # B3 via API local MetaTrader 5 (broker "mt5" — somente dados)
+      - MT5_API_URL=${MT5_API_URL:-http://host.docker.internal:8001}
       # Credenciais de corretora são injetadas em runtime pelo frontend via
       # POST /connections. Não usar IQOPTION_*/AVALON_* aqui.
+    extra_hosts:
+      # Permite o container alcançar a API MT5 rodando no host (VPS Windows)
+      - "host.docker.internal:host-gateway"
     volumes:
       - .:/app
     restart: unless-stopped

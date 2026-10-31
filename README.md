@@ -128,6 +128,38 @@ GET  /connections/{id}/orders/{orderId}/result
 GET /events?limit=100
 ```
 
+## B3 via MetaTrader 5 (broker "mt5")
+
+Fonte de dados da **B3** via API local `b3-mt5-api` rodando na VPS Windows ao
+lado do terminal MT5. Ponte HTTP/WS — **somente dados**
+(candles/cotações; sem ordens ou saldo).
+
+**Catálogo curado: o módulo B3 expõe apenas 2 ativos** — `WIN` (Mini Ibovespa,
+contrato vigente `WINZ26`) e `BIT` (Futuro de Bitcoin, contrato vigente
+`BITX26`). O id é estável entre meses; a API MT5 resolve `WIN` → `WIN$`
+(contínuo por liquidez, histórico muito maior) e devolve o contrato no nome.
+
+```env
+# .env do gateway (ou .env.portainer)
+MT5_API_URL=http://<IP_DA_VPS_WINDOWS>:8001
+```
+
+Criar conexão (sem credenciais — a autenticação é a sessão do MT5):
+
+```bash
+curl -X POST http://localhost:8000/connections \
+  -H "Content-Type: application/json" \
+  -d '{"broker": "mt5", "name": "B3 Toro"}'
+```
+
+Depois disso `/connections/{id}/assets` devolve os 2 ativos do catálogo e
+`/connections/{id}/candles` e `/ws/connections/{id}` funcionam igual aos demais
+brokers (`?asset=WIN&timeframe=1&count=100`). Conexões `mt5` nunca assumem o
+feed padrão de market data quando há IQ Option/Polarium ativa — na UI, escolha
+a fonte no seletor **"Fonte de dados"** da página /mercado (envia
+`connectionId` explícito; o gateway valida o escopo do usuário). Documentação
+completa: `../MT5-API/docs/INTEGRACAO-B3.md`.
+
 ## Exemplos de Uso
 
 ### Criar Conexão

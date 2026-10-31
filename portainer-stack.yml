@@ -38,6 +38,10 @@ services:
       # Agendamento de ordens: desligado por enquanto (fila vazia). Para reativar
       # na fase de maturacao, mude para 1 no .env.portainer.
       - SCHEDULED_ORDERS_ENABLED=${SCHEDULED_ORDERS_ENABLED:-0}
+      # B3 via API local MetaTrader 5 (broker "mt5" — somente dados). Use o IP
+      # da VPS Windows que hospeda o MT5/Toro na rede interna DO SWARM —
+      # host.docker.internal NAO resolve em swarm Linux sem host-gateway.
+      - MT5_API_URL=${MT5_API_URL:-}
     networks:
       - traefik_public
     deploy:
