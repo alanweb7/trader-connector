@@ -280,9 +280,14 @@ class ConnectionRepository:
             "status": status,
             "updated_at": datetime.utcnow().isoformat(),
         }
-        
+
         if error_message is not None:
             update_data["error_message"] = error_message
+        elif status in ("ready", "connected", "disconnected"):
+            # Sucesso/reconexão sem erro novo → apaga a mensagem residual da
+            # última falha (senão a UI mostra "Connection error: ..." com
+            # status ready, confundindo quem está só reconectando).
+            update_data["error_message"] = None
         
         if status == "connected":
             update_data["last_heartbeat"] = datetime.utcnow().isoformat()

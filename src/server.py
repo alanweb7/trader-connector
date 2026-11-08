@@ -2,10 +2,51 @@
 Servidor principal do Broker Gateway
 """
 import asyncio
+import functools
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+
+class _SafeStream:
+    """
+    Wrapper de stdout/stderr que engole OSError de escrita.
+
+    Quando o processo é iniciado por um shell/console que morre (ex.: shell do
+    IDE encerrado), os handles de stdout/stderr ficam inválidos e QUALQUER
+    print() levanta `OSError: [Errno 22] Invalid argument`. Dentro de
+    IQOptionAdapter.connect() esse erro era capturado pelo `except Exception`
+    genérico e virava `Connection error: [Errno 22]` — o login funcionava, mas
+    a conexão era marcada como erro.
+
+    Com este wrapper, logs perdidos nunca derrubam o fluxo de negócio.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except (OSError, ValueError):
+            return 0
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+if not isinstance(sys.stdout, _SafeStream):
+    sys.stdout = _SafeStream(sys.stdout)
+    sys.stderr = _SafeStream(sys.stderr)
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket
@@ -24,11 +65,38 @@ from .infrastructure.database.connection_repository import connection_repository
 from .infrastructure.database.scheduled_order_repository import scheduled_order_repository
 
 # Carregar variáveis de ambiente
-load_dotenv()
+# Caminho EXPLICITO: `load_dotenv()` sem argumento depende do cwd do processo
+# (uvicorn --reload / python -m src.server em outra pasta não acha o .env →
+# SUPABASE_URL ausente → "Supabase credentials not found").
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 
 # Brokers "somente dados" (mt5 = ponte p/ API local MetaTrader 5): não têm
 # credenciais próprias — a autenticação é a sessão do terminal na VPS.
 DATA_ONLY_BROKERS = {"mt5"}
+
+# ---------------------------------------------------------------------------
+# Pools de threads
+# ---------------------------------------------------------------------------
+# O pool padrão do asyncio (`asyncio.to_thread`) é min(32, cpus+4) = 12 com
+# 8 CPUs e é compartilhado com o TRABALHO PESADO da corretora (login, change
+# balance, init_v2, candles). Com 12 conexões ativas ele satura — e as rotas
+# de leitura (/health, /connections) que também usam `asyncio.to_thread`
+# ficam NA FILA e expiram (o /mercado do app fica sem ativos).
+#
+# Separação:
+#   - pool padrão  → trabalho pesado da corretora (via `asyncio.to_thread`);
+#   - pool do BANCO→ chamadas de repositório (Supabase REST) — DEDICADO, para
+#                    que /health e /connections sempre tenham thread livre.
+_DB_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gw-db")
+
+
+async def db_call(fn, *args, **kwargs):
+    """Chamada bloqueante de repositório — roda no pool DEDICADO do banco."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _DB_EXECUTOR, functools.partial(fn, *args, **kwargs)
+    )
 
 
 # Modelos para request/response
@@ -69,8 +137,27 @@ class ErrorResponse(BaseModel):
 
 
 # Lifespan context manager
+# Semáforo das reconexões do boot (criado no lifespan, junto do loop da app).
+# 12 logins SIMULTÂNEOS estouram o limite de requisições da IQ ("The number
+# of requests has been exceeded") e saturam o pool de threads — por isso o
+# reconnect é escalonado.
+_reconnect_semaphore: Optional[asyncio.Semaphore] = None
+
+
 async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) -> None:
     """Reconecta automaticamente uma connection que estava ativa antes do restart."""
+    sem = _reconnect_semaphore
+    if sem is not None:
+        await sem.acquire()
+    try:
+        await _run_auto_reconnect(connection_id, max_attempts)
+    finally:
+        if sem is not None:
+            sem.release()
+
+
+async def _run_auto_reconnect(connection_id: str, max_attempts: int = 3) -> None:
+    """Corpo do auto-reconnect (ver _auto_reconnect_connection)."""
     for attempt in range(1, max_attempts + 1):
         try:
             connection = broker_registry.get_connection(connection_id)
@@ -79,7 +166,7 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
             adapter = broker_registry.get_adapter_for_connection(connection_id)
             if not adapter:
                 return
-            db_conn = await asyncio.to_thread(
+            db_conn = await db_call(
                 connection_repository.get_with_credentials, connection_id
             )
             if not db_conn:
@@ -90,7 +177,7 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
                 return
 
             connection.status = ConnectionStatus.CONNECTING
-            await asyncio.to_thread(
+            await db_call(
                 connection_repository.update_status, connection_id, "connecting"
             )
             result = await adapter.connect({
@@ -100,10 +187,10 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
                 "account_type": connection.account_type.value if hasattr(connection.account_type, "value") else connection.account_type,
             })
             connection.status = ConnectionStatus(result["status"])
-            await asyncio.to_thread(
+            await db_call(
                 connection_repository.update_status, connection_id, result["status"]
             )
-            await asyncio.to_thread(
+            await db_call(
                 connection_repository.log_event,
                 "connection.reconnected",
                 connection_id=connection_id,
@@ -121,7 +208,7 @@ async def _auto_reconnect_connection(connection_id: str, max_attempts: int = 3) 
             if conn:
                 conn.status = ConnectionStatus.ERROR
             try:
-                await asyncio.to_thread(
+                await db_call(
                     connection_repository.update_status,
                     connection_id,
                     "error",
@@ -177,7 +264,7 @@ async def _fire_scheduled_order(row: dict) -> None:
             await asyncio.sleep(delay)
 
         # Claim atômico: só uma instância do worker dispara (pending → firing).
-        claimed = await asyncio.to_thread(
+        claimed = await db_call(
             scheduled_order_repository.claim, order_id
         )
         if not claimed:
@@ -185,7 +272,7 @@ async def _fire_scheduled_order(row: dict) -> None:
 
         lateness = (datetime.now(timezone.utc) - scheduled_for).total_seconds()
         if lateness > SCHEDULED_GRACE_SEC:
-            await asyncio.to_thread(
+            await db_call(
                 scheduled_order_repository.finish,
                 order_id,
                 "missed",
@@ -200,7 +287,7 @@ async def _fire_scheduled_order(row: dict) -> None:
         connection = broker_registry.get_connection(row["connection_id"])
         adapter = broker_registry.get_adapter_for_connection(row["connection_id"])
         if not connection or not adapter:
-            await asyncio.to_thread(
+            await db_call(
                 scheduled_order_repository.finish,
                 order_id,
                 "failed",
@@ -218,7 +305,7 @@ async def _fire_scheduled_order(row: dict) -> None:
             connection_id=row["connection_id"],
         )
 
-        db_order = await asyncio.to_thread(
+        db_order = await db_call(
             connection_repository.save_order,
             connection_id=row["connection_id"],
             broker_order_id=None,
@@ -240,13 +327,13 @@ async def _fire_scheduled_order(row: dict) -> None:
                 if hasattr(result.status, "value")
                 else str(result.status)
             )
-            await asyncio.to_thread(
+            await db_call(
                 connection_repository.update_order,
                 order_id=db_order["id"],
                 status=final_status,
                 broker_order_id=result.id,
             )
-            await asyncio.to_thread(
+            await db_call(
                 connection_repository.log_event,
                 "order.scheduled_fired" if result.id else "order.scheduled_rejected",
                 connection_id=row["connection_id"],
@@ -259,7 +346,7 @@ async def _fire_scheduled_order(row: dict) -> None:
                 },
             )
             if result.id and final_status == "accepted":
-                await asyncio.to_thread(
+                await db_call(
                     scheduled_order_repository.finish,
                     order_id,
                     "fired",
@@ -276,7 +363,7 @@ async def _fire_scheduled_order(row: dict) -> None:
                     flush=True,
                 )
             else:
-                await asyncio.to_thread(
+                await db_call(
                     scheduled_order_repository.finish,
                     order_id,
                     "rejected",
@@ -287,12 +374,12 @@ async def _fire_scheduled_order(row: dict) -> None:
                     flush=True,
                 )
         except BrokerError as e:
-            await asyncio.to_thread(
+            await db_call(
                 connection_repository.update_order,
                 order_id=db_order["id"],
                 status="rejected",
             )
-            await asyncio.to_thread(
+            await db_call(
                 scheduled_order_repository.finish, order_id, "rejected", error=str(e)
             )
             print(f"[Scheduled] order {order_id} REJECTED: {e}", flush=True)
@@ -302,7 +389,7 @@ async def _fire_scheduled_order(row: dict) -> None:
         # (cancel pode chegar de novo durante o await; a próxima limpeza do
         # worker via fail_firing cobre o caso de a escrita ser abortada.)
         try:
-            await asyncio.to_thread(
+            await db_call(
                 scheduled_order_repository.finish,
                 order_id,
                 "failed",
@@ -313,7 +400,7 @@ async def _fire_scheduled_order(row: dict) -> None:
         raise
     except Exception as e:
         try:
-            await asyncio.to_thread(
+            await db_call(
                 scheduled_order_repository.finish, order_id, "failed", error=str(e)
             )
         except Exception:
@@ -335,7 +422,7 @@ async def _scheduled_orders_worker() -> None:
     # Linhas presas em 'firing' de um crash anterior → failed (nunca re-dispara
     # sozinhas; o usuário pode reagendar).
     try:
-        n = await asyncio.to_thread(
+        n = await db_call(
             scheduled_order_repository.fail_firing, "worker reiniciado antes do disparo"
         )
         if n:
@@ -346,7 +433,7 @@ async def _scheduled_orders_worker() -> None:
     try:
         while True:
             try:
-                rows = await asyncio.to_thread(
+                rows = await db_call(
                     scheduled_order_repository.list,
                     statuses=["pending"],
                     limit=500,
@@ -384,7 +471,25 @@ async def lifespan(app: FastAPI):
     """Gerencia o ciclo de vida da aplicação"""
     # Startup
     print("[BrokerGateway] Starting up...")
-    
+
+    # Pool padrão do asyncio: reservado ao TRABALHO PESADO da corretora
+    # (login, change_balance, init_v2, candles). O default é
+    # min(32, cpus+4) = 12 com 8 CPUs — com 12 conexões ativas ele satura
+    # e as conexões travam entre si. O banco tem pool próprio (db_call).
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=max(32, (os.cpu_count() or 4) * 4),
+            thread_name_prefix="gw-broker",
+        )
+    )
+
+    # Reconexões do boot escalonadas (evita estourar o rate limit da IQ)
+    global _reconnect_semaphore
+    _reconnect_semaphore = asyncio.Semaphore(
+        max(1, int(os.getenv("RECONNECT_CONCURRENCY", "4")))
+    )
+
     # Registrar adapters IQ Option e white-labels Quadcode
     broker_registry.register("iqoption", IQOptionAdapter())
     broker_registry.register("polarium", PolariumAdapter())
@@ -489,7 +594,7 @@ app.add_middleware(
 async def health_check():
     """Health check endpoint"""
     try:
-        db = await asyncio.to_thread(connection_repository.list_all)
+        db = await db_call(connection_repository.list_all)
         db_status = "connected"
     except Exception:
         db_status = "disconnected"
@@ -529,7 +634,7 @@ async def list_connections(user_id: Optional[str] = None):
     """Lista conexões (escopo multi-tenant via ?user_id=)"""
     # Get from database (includes persisted connections)
     try:
-        db_connections = await asyncio.to_thread(
+        db_connections = await db_call(
             connection_repository.list_all, user_id=user_id or None
         )
         return {"connections": db_connections}
@@ -658,7 +763,7 @@ async def create_connection(config: ConnectRequest):
 async def get_connection(connection_id: str):
     """Obtém detalhes de uma conexão"""
     # Try database first
-    db_conn = await asyncio.to_thread(connection_repository.get_by_id, connection_id)
+    db_conn = await db_call(connection_repository.get_by_id, connection_id)
     if db_conn:
         return db_conn
     
@@ -908,7 +1013,7 @@ async def get_connection_status(connection_id: str):
     status = await adapter.get_status()
     
     # Update database heartbeat
-    await asyncio.to_thread(connection_repository.update_heartbeat, connection_id)
+    await db_call(connection_repository.update_heartbeat, connection_id)
     
     return status
 
@@ -926,7 +1031,7 @@ async def get_account(connection_id: str):
     
     # Auto-connect if adapter is not connected (e.g. after server reload)
     if not adapter._connected:
-        db_conn = await asyncio.to_thread(
+        db_conn = await db_call(
             connection_repository.get_with_credentials, connection_id
         )
         if db_conn:
@@ -981,7 +1086,7 @@ async def get_balance(connection_id: str):
     
     # Auto-connect if adapter is not connected (e.g. after server reload)
     if not adapter._connected:
-        db_conn = await asyncio.to_thread(
+        db_conn = await db_call(
             connection_repository.get_with_credentials, connection_id
         )
         if db_conn:

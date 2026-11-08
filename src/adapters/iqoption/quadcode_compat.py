@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional
 
@@ -126,6 +127,112 @@ def _auth_base_for(api) -> str:
     return profile.auth_base
 
 
+# ---------------------------------------------------------------------------
+# Anti-deadlock do ssl_Mutex da iqoptionapi
+# ---------------------------------------------------------------------------
+#
+# A lib serializa o envio de mensagens no WebSocket com
+# `global_value.ssl_Mutex[object_id]` (threading.Lock — NÃO reentrante).
+# O balanço acquire/release está quebrado em três pontos de ws/client.py:
+#
+#   - on_message (49/372): adquire no início e só libera no fim — qualquer
+#     exceção no meio (JSON inválido, ativo desconhecido) vaza o lock.
+#   - on_open (424/433): libera SEM ter adquirido (RuntimeError).
+#   - on_close (437): adquire e NUNCA libera — o auto-reconnect chama
+#     run_forever() com o lock retido; se o DNS falhar ([Errno 11001]
+#     getaddrinfo failed), o lock fica preso para sempre.
+#
+# Cada lock vazado consome uma thread do executor padrão do asyncio
+# (min(32, cpus+4) = 12 com 8 CPUs). Com o pool saturado, TODAS as rotas do
+# CONNECTOR que usam asyncio.to_thread (/health, /connections,
+# /connections/{id}) expiram — foi o que zerou o /mercado no app.
+#
+# Correção (sem editar o site-packages — sobrevive a recriar o venv):
+#   - mutex próprio: reentrante, com timeout e release sem dono = no-op;
+#   - on_message: try/finally (libera sempre);
+#   - on_close: sem o acquire que vazava;
+#   - send_websocket_request: acquire com timeout (nunca trava para sempre).
+
+# Segundos que um send espera pelo mutex antes de seguir sem ele
+_SAFE_MUTEX_TIMEOUT = 5.0
+
+
+class _SafeMutex:
+    """Mutex tolerante a lock vazado (substitui o threading.Lock da lib).
+
+    - reentrante: a mesma thread pode adquirir várias vezes (a lib adquire
+      em camadas diferentes — on_message + send_websocket_request);
+    - `acquire()` tem timeout: nunca bloqueia para sempre;
+    - `release()` sem dono = no-op (o `on_open` da lib libera sem adquirir
+      e o `on_close` segura lock de outra thread);
+    - `force_release()`: zera todos os níveis da thread atual (órfãos de
+      exceção).
+    """
+
+    def __init__(self, timeout: float = _SAFE_MUTEX_TIMEOUT):
+        self._cond = threading.Condition()
+        self._owner: Optional[int] = None
+        self._count = 0
+        self._timeout = timeout
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if timeout is None or timeout < 0:
+            timeout = self._timeout
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner == me:
+                self._count += 1
+                return True
+            if not blocking:
+                if self._count:
+                    return False
+                self._owner = me
+                self._count = 1
+                return True
+            deadline = time.monotonic() + timeout
+            while self._count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            self._owner = me
+            self._count = 1
+            return True
+
+    def release(self) -> None:
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner != me:
+                return  # não é dona (ou nunca foi adquirido) → no-op
+            self._count -= 1
+            if self._count <= 0:
+                self._count = 0
+                self._owner = None
+                self._cond.notify_all()
+
+    def force_release(self) -> None:
+        """Libera todos os níveis adquiridos pela thread atual."""
+        me = threading.get_ident()
+        with self._cond:
+            if self._owner != me:
+                return
+            self._count = 0
+            self._owner = None
+            self._cond.notify_all()
+
+    def locked(self) -> bool:
+        with self._cond:
+            return bool(self._count)
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+
 def apply_patches() -> None:
     """Aplica os monkeypatches na iqoptionapi (idempotente)."""
     global _APPLIED
@@ -145,6 +252,9 @@ def apply_patches() -> None:
         original_iq_option_init = stable_api.IQ_Option.__init__
         original_iq_option_connect = stable_api.IQ_Option.connect
         original_wsclient_init = ws_client.WebsocketClient.__init__
+        original_init_global_value = IQOptionAPI.init_global_value
+        original_send_websocket_request = IQOptionAPI.send_websocket_request
+        original_on_message = ws_client.WebsocketClient.on_message
 
         def iq_option_init(
             self,
@@ -233,6 +343,21 @@ def apply_patches() -> None:
             except Exception:
                 pass
 
+        def _safe_release(wss):
+            """Libera o ssl_Mutex do socket sem levantar RuntimeError.
+
+            A lib liberava o lock SEM ter adquirido (on_open) — com o
+            threading.Lock original isso é RuntimeError; com o _SafeMutex
+            é no-op (a thread atual não é a dona do lock).
+            """
+            mutex = global_value.ssl_Mutex.get(id(wss))
+            if mutex is None:
+                return
+            try:
+                mutex.release()
+            except RuntimeError:
+                pass
+
         def wsclient_on_open(wss):
             """WebsocketClient.on_open — auto-reconnect com auth_base do perfil
             (substitui os URLs auth.iqoption.com de ws/client.py:403 e :418)."""
@@ -281,14 +406,87 @@ def apply_patches() -> None:
                     global_value.SSID[id(wss)] = response.cookies["ssid"]
                 except Exception:
                     global_value.auto_reconnect[id(wss)] = False
-                    global_value.ssl_Mutex[id(wss)].release()
+                    _safe_release(wss)
                     return
 
                 data = {"ssid": response.cookies["ssid"], "protocol": 3}
                 wss.send(json.dumps(dict(name="authenticate", msg=data)))
                 global_value.happen_close[id(wss)] = False
 
-            global_value.ssl_Mutex[id(wss)].release()
+            _safe_release(wss)
+
+        # --- anti-deadlock do ssl_Mutex (ver o bloco explicativo acima) ---
+
+        def init_global_value(self, object_id):
+            """init_global_value com o mutex seguro (a lib cria threading.Lock)."""
+            original_init_global_value(self, object_id)
+            global_value.ssl_Mutex[object_id] = _SafeMutex()
+
+        def send_websocket_request(self, name, msg, request_id="", no_force_send=True):
+            """send_websocket_request com acquire COM TIMEOUT.
+
+            A lib fazia `ssl_Mutex.acquire()` sem timeout: com o lock retido
+            por um callback quebrado, TODA chamada de send travava a thread
+            do executor do asyncio — e o pool saturado derrubava o
+            CONNECTOR inteiro (/health, /connections, /assets).
+            """
+            data = json.dumps(dict(name=name, msg=msg, request_id=request_id))
+
+            def doing_send():
+                if no_force_send is False:
+                    self.websocket.send(data)
+                    return
+                mutex = global_value.ssl_Mutex.get(self.object_id)
+                acquired = False
+                if mutex is not None:
+                    acquired = mutex.acquire(timeout=_SAFE_MUTEX_TIMEOUT)
+                try:
+                    self.websocket.send(data)
+                finally:
+                    if acquired and mutex is not None:
+                        mutex.release()
+
+            logger = logging.getLogger("iqoptionapi.api")
+            try:
+                doing_send()
+            except Exception:
+                self.connect()
+                doing_send()
+            logger.debug(data)
+
+        def wsclient_on_message(self, ws, message):
+            """on_message com try/finally — o lock nunca fica retido.
+
+            O corpo original adquire no início e só libera no fim: uma
+            exceção no meio (JSON inválido, ativo desconhecido) deixava o
+            lock preso para sempre.
+            """
+            mutex = global_value.ssl_Mutex.get(self.api.object_id)
+            if mutex is None:
+                return original_on_message(self, ws, message)
+            mutex.acquire(timeout=_SAFE_MUTEX_TIMEOUT)
+            try:
+                return original_on_message(self, ws, message)
+            finally:
+                # o corpo original libera em ponto fixo; se uma exceção
+                # escapar, o nível fica órfão → force_release limpa tudo
+                # que a thread ainda segura
+                mutex.force_release()
+
+        def wsclient_on_close(wss, close_status_code, close_msg):
+            """on_close SEM o acquire que vazava o lock.
+
+            A lib segurava o ssl_Mutex durante o run_forever() do
+            auto-reconnect: com DNS quebrado ([Errno 11001] getaddrinfo
+            failed) o lock ficava preso e todo send travava.
+            """
+            logger = logging.getLogger("iqoptionapi.ws.client")
+            logger.debug("Websocket connection closed." + str(close_msg))
+            global_value.check_websocket_if_connect[id(wss)] = 0
+            if global_value.auto_reconnect.get(id(wss)) is True:
+                global_value.happen_close[id(wss)] = True
+                wss.sock = None
+                wss.run_forever()
 
         # --- aplica os patches (marcador _quadcode p/ debugging/idempotência) ---
         for fn in (
@@ -300,6 +498,10 @@ def apply_patches() -> None:
             logout_post,
             wsclient_init,
             wsclient_on_open,
+            init_global_value,
+            send_websocket_request,
+            wsclient_on_message,
+            wsclient_on_close,
         ):
             fn._quadcode = True  # type: ignore[attr-defined]
 
@@ -309,8 +511,12 @@ def apply_patches() -> None:
         Login._post = login_post
         _2FA._post = twofa_post
         Logout._post = logout_post
+        IQOptionAPI.init_global_value = init_global_value
+        IQOptionAPI.send_websocket_request = send_websocket_request
         ws_client.WebsocketClient.__init__ = wsclient_init
         ws_client.WebsocketClient.on_open = staticmethod(wsclient_on_open)
+        ws_client.WebsocketClient.on_message = wsclient_on_message
+        ws_client.WebsocketClient.on_close = staticmethod(wsclient_on_close)
 
         _APPLIED = True
 
